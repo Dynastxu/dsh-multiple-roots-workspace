@@ -1,6 +1,6 @@
 {
   "name": "@dynastxu/dsh-multiple-roots-workspace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Attach extra folders, or another workspace's folders, to a DeepSeek Harness workspace with per-folder read-only control.",
   "keywords": [
     "deepseek-harness",
