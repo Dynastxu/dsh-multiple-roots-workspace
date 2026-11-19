@@ -338,20 +338,26 @@ window.__ModuleLoader__.load({
     const { createPortal } = require("react-dom") as ReactDOMAPI;
     const createElement = React.createElement;
 
-    /** The dialog's inline icons. */
+    /** The host's closed-folder glyph, copied so the dialog matches workspace rows. */
     function IconFolder(): ReactElement {
       return createElement(
         "svg",
         {
           className: "mr-icon",
-          viewBox: "0 0 20 20",
-          width: 18,
-          height: 18,
+          viewBox: "0 0 16 16",
+          width: 16,
+          height: 16,
+          fill: "none",
+          strokeWidth: 1,
           "aria-hidden": true,
         },
         createElement("path", {
-          fill: "currentColor",
-          d: "M2.5 5.75c0-.97.78-1.75 1.75-1.75h3.1c.46 0 .9.18 1.24.5l.9.9h5.26c.97 0 1.75.78 1.75 1.75v6.6c0 .97-.78 1.75-1.75 1.75h-10.5c-.97 0-1.75-.78-1.75-1.75v-9.75zm1.5.25v9.5c0 .14.11.25.25.25h10.5c.14 0 .25-.11.25-.25v-6.35a.25.25 0 0 0-.25-.25h-6.1l-1.3-1.3a.25.25 0 0 0-.18-.07h-3.17a.25.25 0 0 0-.25.25z",
+          d: "M1.50439 3.11059C1.50439 2.55831 1.95211 2.1106 2.50439 2.1106H5.43389C5.67773 2.1106 5.91318 2.19969 6.09593 2.36113L7.71649 3.79265C7.89924 3.95409 8.1347 4.04319 8.3785 4.04319H13.4958C14.0481 4.04319 14.4958 4.4909 14.4958 5.04319V12.8894C14.4958 13.4417 14.0481 13.8894 13.4958 13.8894H2.50439C1.95211 13.8894 1.50439 13.4417 1.50439 12.8894V4.04319V3.11059Z",
+          stroke: "currentColor",
+        }),
+        createElement("path", {
+          d: "M3.63501 7.66614H12.3647",
+          stroke: "currentColor",
         }),
       );
     }
