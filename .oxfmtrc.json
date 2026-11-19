@@ -1,9 +1,7 @@
 {
   "$schema": "./node_modules/oxfmt/configuration_schema.json",
   "ignorePatterns": [
-    "index.js",
-    "client.js",
-    ".build/**",
+    "lib/**",
     "node_modules/**",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",

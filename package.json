@@ -14,8 +14,7 @@
   "license": "MIT",
   "author": "Dynastxu <151742029+dynastxu@users.noreply.github.com>",
   "files": [
-    "index.js",
-    "client.js",
+    "lib",
     "cordis.patch.yml",
     "locale",
     "icon.svg",
@@ -23,10 +22,10 @@
     "LICENSE"
   ],
   "type": "module",
-  "main": "index.js",
+  "main": "lib/index.js",
   "exports": {
-    ".": "./index.js",
-    "./client": "./client.js",
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
@@ -36,7 +35,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "vite build && vite build --config vite.client.config.ts && node scripts/copy-build.mjs",
+    "build": "vite build && vite build --config vite.client.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "lint": "oxlint .",

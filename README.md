@@ -35,10 +35,10 @@ Changes apply to the workspace's live Sessions immediately for grants; the model
 
 ## Development
 
-The bundle is authored in TypeScript and built with Vite. Vite emits into `.build/`; the build script copies the two entries to the package root, where the installed loader and Client export resolve them (`index.js`, `client.js`).
+The bundle is authored in TypeScript and built with Vite into `lib/`: `lib/index.js` is the Host entry and `lib/client.js` the Client export the installed loader resolves.
 
 ```sh
-pnpm run build        # Vite: index.js (Host) + client.js (Client)
+pnpm run build        # Vite: lib/index.js (Host) + lib/client.js (Client)
 pnpm run typecheck    # tsc --noEmit
 pnpm run test         # Vitest (worker threads; the default fork pool is blocked by the DSH sandbox)
 pnpm run lint         # oxlint
