@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Multiple-root workspace",
-    "description": "Attach extra folders, or another workspace's folders, to a workspace. Each attached folder has a read-only switch and a remove button."
+    "description": "Attach extra folders, or reference another workspace expanded live, to a workspace. Each row has a read-only switch, and a workspace row exposes per-directory control."
   }
 }

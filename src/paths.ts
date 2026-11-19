@@ -44,6 +44,19 @@ export function canonicalizePath(value: unknown): string | undefined {
 }
 
 /**
+ * Whether a canonical path names a directory that exists right now.
+ * @param value - canonical path.
+ * @returns true when the path is an existing directory.
+ */
+export function isExistingDirectory(value: string): boolean {
+  try {
+    return fs.statSync(value).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The comparison key for one path: case-folded on Windows, exact elsewhere.
  * Both inputs must already be canonical.
  * @param value - canonical path.

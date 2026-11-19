@@ -1,12 +1,14 @@
 # Multiple-root workspace
 
-A DeepSeek Harness bundle that attaches extra folders — or another workspace's folders — to one workspace, with a per-folder read-only switch and a remove button.
+A DeepSeek Harness bundle that attaches extra folders — or entire workspaces — to one workspace, with per-folder read-only control.
 
 - **No new tools.** The agent keeps using the native `read` / `write` / `edit` / `apply_patch` / `bash` tools; the attached folders simply join the writable scope.
 - **One workspace menu entry.** Open a workspace's `…` menu → **Attached folders…**.
-- **Add folder or add workspace.** _Add folder_ picks any directory. _Add workspace_ picks another DSH workspace and attaches its root directory together with every folder already attached to it.
-- **Read-only per row.** A writable row gets a `registerWritableRoot` grant for every live Session of that workspace. A read-only row gets no grant and a tool guard rejects file mutations that still land inside it (for example when the folder is inside the primary workspace).
-- **Prompt only when needed.** The attached list reaches the model as runtime context that renders empty without rows. The agent loop commits one snapshot when the conversation first needs it and another only when the rendered list changes — no per-step duplicate.
+- **Add folder or add workspace.** _Add folder_ picks any directory and stores one folder row. _Add workspace_ stores **one workspace row**: a live reference that contributes that workspace's root plus everything its own list contributes at that moment. Later changes in the referenced workspace are picked up without re-attaching.
+- **Live expansion.** Every read (model context, grants, the read-only guard, the dialog) expands workspace rows again, with cycle detection, so `A → B → A` stays finite.
+- **Missing directories are harmless.** A row whose directory disappeared stays listed and is marked **missing** in the dialog; injection and writable-root grants skip it, so the model is never told about a path that is not there and a stale grant can never fail the workspace's other writes. The row works again as soon as the directory comes back.
+- **Read-only resolution.** A directory is read-only when a per-directory override says so; otherwise an explicit writable folder row for the same path wins; otherwise any read-only contribution wins (a folder row in an attached workspace, or a workspace row's blanket switch). The dialog's **Details** view exposes the expanded directories with their own switches (stored as overrides, with **Follow** to clear one).
+- **Prompt only when needed.** The attached list reaches the model as runtime context that renders empty without existing directories. The agent loop commits one snapshot when the conversation first needs it and another only when the rendered list changes — no per-step duplicate.
 
 ## Install
 
@@ -29,7 +31,7 @@ A local-directory install links the checkout; restart DSH or reload the page aft
 
 1. Hover a workspace row in the sidebar and open its `…` menu.
 2. Choose **Attached folders…**.
-3. Add folders or workspaces, toggle **Read-only** per row, remove rows with the trash button.
+3. Add folders or workspaces, toggle **Read-only** per row, open **Details** on a workspace row for per-directory switches, remove rows with the trash button.
 
 Changes apply to the workspace's live Sessions immediately for grants; the model sees the updated list at its next request.
 
@@ -55,15 +57,24 @@ After changing `src/`, rerun `pnpm run build`, then restart the Host (or reload 
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "workspaces": {
     "<canonical workspace path>": {
       "entries": [
         {
+          "kind": "folder",
           "path": "<canonical folder>",
           "readOnly": false,
-          "source": "folder",
           "addedAt": 0
+        },
+        {
+          "kind": "workspace",
+          "path": "<canonical workspace path>",
+          "readOnly": false,
+          "addedAt": 0,
+          "overrides": {
+            "<canonical directory>": true
+          }
         }
       ]
     }
@@ -71,15 +82,15 @@ After changing `src/`, rerun `pnpm run build`, then restart the Host (or reload 
 }
 ```
 
-Writes are atomic (temporary sibling plus rename).
+Version 1 files (folder snapshots, `source: "folder" | "workspace"`) load as `folder` rows and are rewritten as version 2 on the next change: every path is preserved, and only the provenance that version 1 never recorded reliably is dropped. Writes are atomic (temporary sibling plus rename).
 
 ## Behaviour and limits
 
-- **Grants are runtime-only and per Session.** `registerWritableRoot` is effect-scoped; the plugin re-registers the current list on every `agent/pre-step`, so resumed, forked, and newly created Sessions converge without a separate registry.
+- **Grants are runtime-only and per Session.** `registerWritableRoot` is effect-scoped; the plugin re-registers the current effective list on every `agent/pre-step`, so resumed, forked, and newly created Sessions converge without a separate registry. Grants cover existing writable directories only; a directory that disappears is dropped from the Session at the next step, and one that reappears is granted again.
+- **Workspace references are expanded live.** Nested references are followed (depth-capped at 16, cycles skipped) and the same directory reached through several rows appears once.
+- **Read-only is resolved per directory.** Precedence: per-directory override → explicit folder row of the owning workspace → any read-only contribution along the expansion (a referenced folder row, or a workspace row's blanket switch). Missing directories are skipped by the guard, since no mutation can land there.
 - **Windows process confinement ignores extra writable roots.** Under `workspace-write`, the harness file tools honor attached folders on every platform, but a sandboxed `bash` / PowerShell process can still be denied outside the workspace root. This is an upstream limitation of the sandbox backend, not of this plugin.
 - **Read-only is enforced for the file tools** (`write`, `edit`, `str_replace_editor`, `apply_patch`). A shell command that writes into a read-only folder which is also inside the primary workspace is not parsed or blocked.
-- **Attached folders stay listed when they disappear.** Grants and containment checks report the failure (or simply stop matching); remove the row to clean it up.
-- **Up to 64 attached folders per workspace.**
+- **Up to 64 rows per workspace.**
 - **Routes are loopback-only.** The dialog's state routes are served to the local DSH page and reject a remote authority.
-- Attaching a workspace is one level: its root plus the folders it currently has on its own list; nested workspace lists are not followed recursively.
 - Removing the plugin releases its own grants on unload; profile-installed grants from other plugins are unaffected.

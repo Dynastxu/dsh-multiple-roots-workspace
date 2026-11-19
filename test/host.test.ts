@@ -5,13 +5,17 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   MAX_ENTRIES,
+  expandAttachedWorkspace,
+  expandEntries,
   findReadOnlyViolation,
   makeEntry,
   mergeEntries,
+  normalizeStoredEntry,
   parseToolTargets,
   renderContext,
+  setEntryOverride,
 } from "../src/entries";
-import type { Entry } from "../src/entries";
+import type { DirectoryView, Entry, RowsOf } from "../src/entries";
 import { isSubPath } from "../src/paths";
 import { MultipleRootsError, MultipleRootsStore } from "../src/store";
 
@@ -54,16 +58,41 @@ function expectStoreError(run: () => unknown, code: string): void {
   expect(caught.code).toBe(code);
 }
 
+/** A resolved directory for rendering tests. */
+function view(
+  target: string,
+  options: { readOnly?: boolean; existing?: boolean } = {},
+): DirectoryView {
+  return {
+    path: target,
+    readOnly: options.readOnly === true,
+    existing: options.existing !== false,
+    overridden: false,
+    explicit: false,
+    workspaceRoot: false,
+  };
+}
+
+/** A row source over a plain map. */
+function rowsOfMap(map: Readonly<Record<string, Entry[]>>): RowsOf {
+  return (workspacePath) => map[workspacePath] ?? [];
+}
+
 describe("renderContext", () => {
   it("contributes nothing without rows", () => {
     expect(renderContext([])).toBe("");
   });
 
-  it("lists paths and marks read-only rows", () => {
-    const text = renderContext([makeEntry(folderA, { readOnly: true }), makeEntry(folderB)]);
+  it("lists paths and marks read-only directories", () => {
+    const text = renderContext([
+      view(folderA, { readOnly: true }),
+      view(folderB),
+      view(path.join(root, "gone"), { existing: false }),
+    ]);
     expect(text).toMatch(new RegExp(escape(folderA)));
     expect(text).toMatch(/\(read-only\)/u);
     expect(text).not.toMatch(new RegExp(`${escape(folderB)} \\(read-only\\)`));
+    expect(text).not.toContain(path.join(root, "gone"));
   });
 });
 
@@ -114,40 +143,38 @@ describe("isSubPath", () => {
 
 describe("findReadOnlyViolation", () => {
   // Built per test: Vitest collects suite bodies before `beforeAll` runs.
-  const entries = (): Entry[] => [makeEntry(folderA, { readOnly: true }), makeEntry(folderB)];
+  const rows = (): { path: string; readOnly: boolean }[] => [
+    { path: folderA, readOnly: true },
+    { path: folderB, readOnly: false },
+  ];
 
   it("denies a write inside the read-only row", () => {
     const result = findReadOnlyViolation(
       "write",
       { file_path: path.join(folderA, "x.txt") },
       workspace,
-      entries(),
+      rows(),
     );
     expect(result?.root).toBe(folderA);
   });
 
   it("allows writable rows and paths outside every attached row", () => {
     expect(
-      findReadOnlyViolation(
-        "write",
-        { file_path: path.join(folderB, "x.txt") },
-        workspace,
-        entries(),
-      ),
+      findReadOnlyViolation("write", { file_path: path.join(folderB, "x.txt") }, workspace, rows()),
     ).toBeUndefined();
     expect(
       findReadOnlyViolation(
         "write",
         { file_path: path.join(root, "elsewhere.txt") },
         workspace,
-        entries(),
+        rows(),
       ),
     ).toBeUndefined();
   });
 
   it("resolves relative targets against the Session cwd", () => {
     expect(
-      findReadOnlyViolation("edit", { file_path: "../alpha/x.txt" }, workspace, entries())?.root,
+      findReadOnlyViolation("edit", { file_path: "../alpha/x.txt" }, workspace, rows())?.root,
     ).toBe(folderA);
   });
 
@@ -162,7 +189,7 @@ describe("findReadOnlyViolation", () => {
       "+b",
       "*** End Patch",
     ].join("\n");
-    expect(findReadOnlyViolation("apply_patch", { input: patch }, workspace, entries())?.root).toBe(
+    expect(findReadOnlyViolation("apply_patch", { input: patch }, workspace, rows())?.root).toBe(
       folderA,
     );
   });
@@ -170,32 +197,201 @@ describe("findReadOnlyViolation", () => {
   it("does nothing without read-only rows", () => {
     expect(
       findReadOnlyViolation("write", { file_path: path.join(folderA, "x") }, workspace, [
-        makeEntry(folderA),
+        { path: folderA, readOnly: false },
       ]),
     ).toBeUndefined();
   });
 });
 
-describe("mergeEntries", () => {
-  it("keeps the first occurrence and ignores duplicates", () => {
+describe("rows and overrides", () => {
+  it("keeps a folder row and a workspace row for the same path apart", () => {
     const merged = mergeEntries(
-      [makeEntry(folderA, { readOnly: true })],
-      [makeEntry(folderA), makeEntry(folderB)],
+      [makeEntry(folderA, { kind: "folder", readOnly: true })],
+      [makeEntry(folderA, { kind: "workspace" }), makeEntry(folderA, { kind: "folder" })],
     );
     expect(merged).toHaveLength(2);
-    expect(merged[0]?.readOnly).toBe(true);
+    expect(merged.map((entry) => entry.kind)).toEqual(["folder", "workspace"]);
+  });
+
+  it("sets, replaces, and clears overrides", () => {
+    const rows = [makeEntry(folderA, { kind: "workspace" })];
+    const set = setEntryOverride(rows, folderA, folderB, true);
+    expect(set.changed).toBe(true);
+    expect(set.entries[0]?.overrides[folderB]).toBe(true);
+    const cleared = setEntryOverride(set.entries, folderA, folderB, null);
+    expect(cleared.entries[0]?.overrides).toEqual({});
+  });
+
+  it("normalizes stored rows with an unknown kind as a folder", () => {
+    const entry = normalizeStoredEntry({ path: folderA, readOnly: true, source: "workspace" });
+    expect(entry?.kind).toBe("folder");
+  });
+});
+
+describe("expandEntries", () => {
+  it("marks missing directories without dropping them", () => {
+    const rows = rowsOfMap({ [workspace]: [makeEntry(folderA, { kind: "folder" })] });
+    const dirs = expandEntries(rows, workspace, { exists: (target) => target === folderB });
+    expect(dirs).toHaveLength(1);
+    expect(dirs[0]).toMatchObject({ path: folderA, existing: false });
+  });
+
+  it("expands an attached workspace live, root first", () => {
+    const rows = rowsOfMap({
+      [workspace]: [makeEntry(folderB, { kind: "workspace" })],
+      [folderB]: [makeEntry(folderA, { kind: "folder", readOnly: true })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.map((directory) => directory.path)).toEqual([folderB, folderA]);
+    expect(dirs[0]).toMatchObject({ workspaceRoot: true, readOnly: false });
+    expect(dirs[1]).toMatchObject({ readOnly: true, workspaceRoot: false });
+  });
+
+  it("follows nested workspace references and stops at cycles", () => {
+    const rows = rowsOfMap({
+      [workspace]: [makeEntry(folderB, { kind: "workspace" })],
+      [folderB]: [makeEntry(workspace, { kind: "workspace" })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.map((directory) => directory.path)).toEqual([folderB]);
+  });
+
+  it("resolves each directory once, keeping the first position", () => {
+    const rows = rowsOfMap({
+      [workspace]: [
+        makeEntry(folderA, { kind: "folder", readOnly: true }),
+        makeEntry(folderB, { kind: "workspace" }),
+      ],
+      [folderB]: [makeEntry(folderA, { kind: "folder" })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.map((directory) => directory.path)).toEqual([folderA, folderB]);
+    expect(dirs[0]?.readOnly).toBe(true);
+  });
+
+  it("lets an explicit writable folder row override inherited read-only", () => {
+    const rows = rowsOfMap({
+      [workspace]: [
+        makeEntry(folderA, { kind: "folder" }),
+        makeEntry(folderB, { kind: "workspace" }),
+      ],
+      [folderB]: [makeEntry(folderA, { kind: "folder", readOnly: true })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.find((directory) => directory.path === folderA)).toMatchObject({
+      readOnly: false,
+      explicit: true,
+    });
+  });
+
+  it("inherits the workspace row's blanket read-only switch", () => {
+    const rows = rowsOfMap({
+      [workspace]: [makeEntry(folderB, { kind: "workspace", readOnly: true })],
+      [folderB]: [makeEntry(folderA, { kind: "folder" })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.every((directory) => directory.readOnly)).toBe(true);
+  });
+
+  it("lets a per-directory override outrank inheritance and folder rows", () => {
+    const rows = rowsOfMap({
+      [workspace]: [
+        makeEntry(folderA, { kind: "workspace", overrides: { [folderB]: true } }),
+        makeEntry(folderB, { kind: "folder" }),
+      ],
+      [folderA]: [makeEntry(folderB, { kind: "folder" })],
+    });
+    const dirs = expandEntries(rows, workspace);
+    expect(dirs.find((directory) => directory.path === folderB)).toMatchObject({
+      readOnly: true,
+      overridden: true,
+    });
+  });
+
+  it("reads the referenced workspace again on every expansion", () => {
+    const live: Record<string, Entry[]> = {
+      [workspace]: [makeEntry(folderB, { kind: "workspace" })],
+    };
+    const liveRows: RowsOf = (target) => live[target] ?? [];
+    expect(expandEntries(liveRows, workspace)).toHaveLength(1);
+    live[folderB] = [makeEntry(folderA, { kind: "folder" })];
+    expect(expandEntries(liveRows, workspace).map((directory) => directory.path)).toEqual([
+      folderB,
+      folderA,
+    ]);
+  });
+
+  it("expands one attached workspace's subtree for the detail view", () => {
+    const rows = rowsOfMap({
+      [workspace]: [
+        makeEntry(folderA, { kind: "folder" }),
+        makeEntry(folderB, { kind: "workspace" }),
+      ],
+      [folderB]: [makeEntry(path.join(root, "deep"), { kind: "folder" })],
+    });
+    const detail = expandAttachedWorkspace(rows, workspace, folderB);
+    expect(detail.map((directory) => directory.path)).toEqual([folderB, path.join(root, "deep")]);
+    expect(expandAttachedWorkspace(rows, workspace, folderA)).toEqual([]);
   });
 });
 
 describe("MultipleRootsStore", () => {
-  it("persists attached folders across reloads", () => {
+  it("persists folder and workspace rows across reloads", () => {
     const filePath = storage();
     const store = new MultipleRootsStore({ filePath });
-    const entries = store.addFolder(workspace, folderA);
-    expect(entries).toHaveLength(1);
-    expect(entries[0]?.path).toBe(folderA);
+    store.addFolder(workspace, folderA);
+    store.addWorkspace(workspace, folderB);
     const again = new MultipleRootsStore({ filePath });
-    expect(again.entriesFor(workspace).map((entry) => entry.path)).toEqual([folderA]);
+    expect(again.entriesFor(workspace).map((entry) => [entry.kind, entry.path])).toEqual([
+      ["folder", folderA],
+      ["workspace", folderB],
+    ]);
+  });
+
+  it("stores one row per attached workspace instead of copying its list", () => {
+    const store = new MultipleRootsStore({ filePath: storage() });
+    store.addFolder(folderB, folderA);
+    const entries = store.addWorkspace(workspace, folderB);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ kind: "workspace", path: folderB });
+    expect(store.addWorkspace(workspace, folderB)).toHaveLength(1);
+  });
+
+  it("keeps a folder row next to a workspace row for the same directory", () => {
+    const store = new MultipleRootsStore({ filePath: storage() });
+    store.addWorkspace(workspace, folderB);
+    store.addFolder(workspace, folderB);
+    expect(store.entriesFor(workspace).map((entry) => entry.kind)).toEqual(["workspace", "folder"]);
+  });
+
+  it("distinguishes rows by kind when toggling and removing", () => {
+    const filePath = storage();
+    const store = new MultipleRootsStore({ filePath });
+    store.addWorkspace(workspace, folderB);
+    store.addFolder(workspace, folderB);
+    store.setReadOnly(workspace, "workspace", folderB, true);
+    expect(store.entriesFor(workspace).map((entry) => [entry.kind, entry.readOnly])).toEqual([
+      ["workspace", true],
+      ["folder", false],
+    ]);
+    expect(store.remove(workspace, "workspace", folderB)).toHaveLength(1);
+    expect(store.entriesFor(workspace)[0]?.kind).toBe("folder");
+    expectStoreError(
+      () => store.setReadOnly(workspace, "workspace", folderB, true),
+      "unknown-entry",
+    );
+  });
+
+  it("persists and clears per-directory overrides", () => {
+    const filePath = storage();
+    const store = new MultipleRootsStore({ filePath });
+    store.addWorkspace(workspace, folderB);
+    store.setOverride(workspace, folderB, folderA, true);
+    expect(new MultipleRootsStore({ filePath }).entriesFor(workspace)[0]?.overrides[folderA]).toBe(
+      true,
+    );
+    store.setOverride(workspace, folderB, folderA, null);
+    expect(new MultipleRootsStore({ filePath }).entriesFor(workspace)[0]?.overrides).toEqual({});
   });
 
   it("is idempotent for an already attached folder", () => {
@@ -214,31 +410,49 @@ describe("MultipleRootsStore", () => {
     ];
     for (const [candidate, code] of cases) {
       expectStoreError(() => store.addFolder(workspace, candidate), code);
+      expectStoreError(() => store.addWorkspace(workspace, candidate), code);
     }
   });
 
-  it("toggles read-only, persists it, and removes rows", () => {
+  it("loads version 1 snapshot rows as folder rows and rewrites version 2", () => {
     const filePath = storage();
+    writeFileSync(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          [workspace]: {
+            entries: [
+              { path: folderA, readOnly: false, source: "folder", addedAt: 1 },
+              { path: folderB, readOnly: true, source: "workspace", addedAt: 2 },
+            ],
+          },
+        },
+      }),
+    );
     const store = new MultipleRootsStore({ filePath });
-    store.addFolder(workspace, folderA);
-    const updated = store.setReadOnly(workspace, folderA, true);
-    expect(updated[0]?.readOnly).toBe(true);
-    expect(new MultipleRootsStore({ filePath }).entriesFor(workspace)[0]?.readOnly).toBe(true);
-    expectStoreError(() => store.setReadOnly(workspace, folderB, true), "unknown-entry");
-    expect(store.remove(workspace, folderA)).toHaveLength(0);
-    expect(store.remove(workspace, folderA)).toHaveLength(0);
+    expect(store.entriesFor(workspace).map((entry) => [entry.kind, entry.readOnly])).toEqual([
+      ["folder", false],
+      ["folder", true],
+    ]);
+    store.setReadOnly(workspace, "folder", folderA, true);
+    const saved = JSON.parse(readFileSync(filePath, "utf8")) as {
+      version: number;
+      workspaces: Record<string, { entries: { kind: string }[] }>;
+    };
+    expect(saved.version).toBe(2);
+    expect(saved.workspaces[workspace]?.entries.every((entry) => entry.kind === "folder")).toBe(
+      true,
+    );
   });
 
-  it("merges another workspace's rows without duplicating or attaching the target itself", () => {
-    const store = new MultipleRootsStore({ filePath: storage() });
-    store.addFolder(workspace, folderA);
-    const entries = store.addEntries(workspace, [
-      { path: workspace },
-      { path: folderA },
-      { path: folderB, readOnly: true, source: "workspace" },
-    ]);
-    expect(entries.map((entry) => entry.path)).toEqual([folderA, folderB]);
-    expect(entries[1]?.readOnly).toBe(true);
+  it("ignores an unsupported schema version with a warning", () => {
+    const filePath = storage();
+    writeFileSync(filePath, JSON.stringify({ version: 99, workspaces: {} }));
+    const warnings: string[] = [];
+    const store = new MultipleRootsStore({ filePath, warn: (message) => warnings.push(message) });
+    expect(store.entriesFor(workspace)).toEqual([]);
+    expect(warnings).toHaveLength(1);
   });
 
   it("enforces the row limit", () => {
@@ -276,23 +490,15 @@ describe("MultipleRootsStore", () => {
     writeFileSync(
       filePath,
       JSON.stringify({
-        version: 1,
+        version: 2,
         workspaces: {
           [workspace]: {
-            entries: [{ path: folderA }, { path: "relative" }, null],
+            entries: [{ path: 7 }, { path: folderA, kind: "folder" }],
           },
         },
       }),
     );
     const store = new MultipleRootsStore({ filePath });
     expect(store.entriesFor(workspace).map((entry) => entry.path)).toEqual([folderA]);
-  });
-
-  it("writes a readable file with one trailing newline", () => {
-    const filePath = storage();
-    new MultipleRootsStore({ filePath }).addFolder(workspace, folderA);
-    const text = readFileSync(filePath, "utf8");
-    expect(text.endsWith("\n")).toBe(true);
-    expect(JSON.parse(text).version).toBe(1);
   });
 });

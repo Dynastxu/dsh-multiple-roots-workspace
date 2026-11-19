@@ -34,11 +34,22 @@ type LocaleDict = Record<string, string>;
 const PACKAGE_ID = "@dynastxu/dsh-multiple-roots-workspace";
 const NS = "multiple-roots";
 
-/** One attached folder as the Host projects it. */
-interface Entry {
+/** One expanded directory inside an attached workspace. */
+interface EntryDir {
   readonly path: string;
   readonly readOnly: boolean;
-  readonly source: "folder" | "workspace";
+  readonly exists: boolean;
+  readonly overridden: boolean;
+}
+
+/** One attached row as the Host projects it. */
+interface Entry {
+  readonly kind: "folder" | "workspace";
+  readonly path: string;
+  readonly readOnly: boolean;
+  readonly exists: boolean;
+  readonly missing: number;
+  readonly dirs?: readonly EntryDir[];
 }
 
 /** One registered Workspace offered by the picker. */
@@ -131,7 +142,7 @@ const zh: LocaleDict = {
   title: "附加文件夹",
   close: "关闭",
   description:
-    "附加到当前工作区的其他目录。可写目录会授予本工作区的会话写权限；只读目录只允许读取。",
+    "附加到当前工作区的其他目录。可写目录会授予本工作区的会话写权限；只读目录只允许读取。附加的工作区按它当前列表实时展开。",
   primary: "主工作区",
   readOnly: "只读",
   remove: "移除",
@@ -142,10 +153,17 @@ const zh: LocaleDict = {
   loading: "加载中…",
   back: "返回",
   workspacesTitle: "选择工作区",
-  workspacesHint: "添加后会附加该工作区的根目录，以及它已有的全部附加文件夹。",
+  workspacesHint: "添加后记录该工作区，注入与授权按它当前的附加列表实时展开。",
   workspacesEmpty: "没有其他工作区。",
   sourceWorkspace: "工作区",
   sourceFolder: "文件夹",
+  missing: "不存在",
+  partialMissing: "部分不存在",
+  detail: "明细",
+  detailHide: "收起",
+  dirsTitle: "展开的目录",
+  follow: "跟随",
+  workspaceRoot: "工作区根目录",
 };
 
 const en: LocaleDict = {
@@ -153,7 +171,7 @@ const en: LocaleDict = {
   title: "Attached folders",
   close: "Close",
   description:
-    "Extra directories attached to this workspace. Writable folders let its sessions write there; read-only folders stay readable only.",
+    "Extra directories attached to this workspace. Writable folders let its sessions write there; read-only folders stay readable only. An attached workspace is expanded live from its own list.",
   primary: "Primary",
   readOnly: "Read-only",
   remove: "Remove",
@@ -164,10 +182,18 @@ const en: LocaleDict = {
   loading: "Loading…",
   back: "Back",
   workspacesTitle: "Choose a workspace",
-  workspacesHint: "Adds that workspace folder and every folder already attached to it.",
+  workspacesHint:
+    "Records that workspace and expands its current attached list live for injection and grants.",
   workspacesEmpty: "No other workspaces.",
   sourceWorkspace: "Workspace",
   sourceFolder: "Folder",
+  missing: "Missing",
+  partialMissing: "Partly missing",
+  detail: "Details",
+  detailHide: "Hide",
+  dirsTitle: "Expanded directories",
+  follow: "Follow",
+  workspaceRoot: "Workspace root",
 };
 
 const STYLES = `
@@ -208,6 +234,15 @@ const STYLES = `
   .mr-button-primary:hover:not(:disabled) { background: var(--dsw-alias-button-primary-hover); }
   .mr-error { margin: 0 24px 8px; padding: 8px 10px; border-radius: var(--dsw-radius-sm); background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-state-danger-primary); font-size: 12px; line-height: 18px; }
   .mr-workspace-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--dsw-radius-md); background: var(--dsw-alias-bg-layer-1); }
+  .mr-status { flex: none; font-size: 12px; line-height: 18px; padding: 0 6px; border-radius: var(--dsw-radius-xs); color: var(--dsw-alias-state-danger-primary); background: var(--dsw-alias-bg-layer-1); }
+  .mr-status-warn { color: var(--dsw-alias-state-warning-primary, var(--dsw-alias-label-secondary)); }
+  .mr-link { flex: none; display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px; border: 0; border-radius: var(--dsw-radius-xs); background: transparent; color: var(--dsw-alias-label-secondary); font-size: 12px; line-height: 18px; cursor: pointer; }
+  .mr-link:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
+  .mr-detail { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 4px 26px; padding: 6px 8px; border-left: 2px solid var(--dsw-alias-border-l3); }
+  .mr-detail-title { font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary); }
+  .mr-dir { display: flex; align-items: center; gap: 8px; min-height: 30px; }
+  .mr-dir-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .mr-dir-path { font-size: 12px; line-height: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   @media (max-width: 560px) {
     .mr-root { padding: 12px; }
     .mr-header { padding: 16px 12px 8px 16px; }
@@ -245,14 +280,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Validate one projected row from the Host. */
-function isEntry(value: unknown): value is Entry {
+/** Validate one expanded directory from the Host. */
+function isEntryDir(value: unknown): value is EntryDir {
   if (!isRecord(value)) return false;
   return (
     typeof value.path === "string" &&
     typeof value.readOnly === "boolean" &&
-    (value.source === "folder" || value.source === "workspace")
+    typeof value.exists === "boolean" &&
+    typeof value.overridden === "boolean"
   );
+}
+
+/** Validate one projected row from the Host. */
+function isEntry(value: unknown): value is Entry {
+  if (!isRecord(value)) return false;
+  if (
+    typeof value.path !== "string" ||
+    typeof value.readOnly !== "boolean" ||
+    typeof value.exists !== "boolean" ||
+    typeof value.missing !== "number" ||
+    (value.kind !== "folder" && value.kind !== "workspace")
+  ) {
+    return false;
+  }
+  if (value.kind === "workspace" && value.dirs !== undefined) {
+    if (!Array.isArray(value.dirs) || !value.dirs.every(isEntryDir)) return false;
+  }
+  return true;
 }
 
 /** Validate one workspace option from the Host. */
@@ -464,58 +518,160 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** One attached-folder row. */
-    function EntryRow(props: {
-      readonly entry: Entry;
+    /** One directory inside an attached workspace, with its own switch. */
+    function DirRow(props: {
+      readonly dir: EntryDir;
       readonly disabled: boolean;
       readonly t: Translate;
-      readonly onToggle: (entry: Entry, readOnly: boolean) => void;
-      readonly onRemove: (entry: Entry) => void;
+      readonly onOverride: (dir: EntryDir, readOnly: boolean | null) => void;
     }): ReactElement {
-      const { entry, disabled, t } = props;
-      const name = folderName(entry.path);
+      const { dir, disabled, t } = props;
+      const name = folderName(dir.path);
       return createElement(
         "div",
-        { className: "mr-row" },
-        IconFolder(),
+        { className: "mr-dir" },
         createElement(
           "div",
-          { className: "mr-info" },
-          createElement("span", { className: "mr-name", title: entry.path }, name),
-          createElement("span", { className: "mr-path", title: entry.path }, entry.path),
+          { className: "mr-dir-info" },
+          createElement("span", { className: "mr-dir-path", title: dir.path }, name),
         ),
-        createElement(
-          "span",
-          { className: "mr-badge" },
-          entry.source === "workspace" ? t("sourceWorkspace") : t("sourceFolder"),
-        ),
+        !dir.exists && createElement("span", { className: "mr-status" }, t("missing")),
+        dir.overridden &&
+          createElement(
+            "button",
+            {
+              type: "button",
+              className: "mr-link",
+              title: t("follow"),
+              disabled,
+              onClick: () => {
+                props.onOverride(dir, null);
+              },
+            },
+            t("follow"),
+          ),
         createElement(
           "span",
           { className: "mr-toggle", title: t("readOnly") },
-          createElement("span", null, t("readOnly")),
           createElement(Switch, {
-            checked: entry.readOnly,
+            checked: dir.readOnly,
             disabled,
-            label: `${t("readOnly")}: ${entry.path}`,
+            label: `${t("readOnly")}: ${dir.path}`,
             onChange: (next) => {
-              props.onToggle(entry, next);
+              props.onOverride(dir, next);
             },
           }),
         ),
+      );
+    }
+
+    /** One attached row: a folder, or a workspace that expands live. */
+    function EntryRow(props: {
+      readonly entry: Entry;
+      readonly disabled: boolean;
+      readonly expanded: boolean;
+      readonly t: Translate;
+      readonly onToggle: (entry: Entry, readOnly: boolean) => void;
+      readonly onToggleDetail: (entry: Entry) => void;
+      readonly onOverride: (entry: Entry, dir: EntryDir, readOnly: boolean | null) => void;
+      readonly onRemove: (entry: Entry) => void;
+    }): ReactElement {
+      const { entry, disabled, expanded, t } = props;
+      const name = folderName(entry.path);
+      const status = !entry.exists
+        ? t("missing")
+        : entry.kind === "workspace" && entry.missing > 0
+          ? `${t("partialMissing")} (${String(entry.missing)})`
+          : null;
+      return createElement(
+        React.Fragment,
+        null,
         createElement(
-          "button",
-          {
-            type: "button",
-            className: "mr-delete",
-            "aria-label": `${t("remove")}: ${entry.path}`,
-            title: t("remove"),
-            disabled,
-            onClick: () => {
-              props.onRemove(entry);
+          "div",
+          { className: "mr-row" },
+          IconFolder(),
+          createElement(
+            "div",
+            { className: "mr-info" },
+            createElement("span", { className: "mr-name", title: entry.path }, name),
+            createElement("span", { className: "mr-path", title: entry.path }, entry.path),
+          ),
+          createElement(
+            "span",
+            { className: "mr-badge" },
+            entry.kind === "workspace" ? t("sourceWorkspace") : t("sourceFolder"),
+          ),
+          status !== null &&
+            createElement(
+              "span",
+              {
+                className: entry.exists ? "mr-status mr-status-warn" : "mr-status",
+                title: status,
+              },
+              status,
+            ),
+          entry.kind === "workspace" &&
+            createElement(
+              "button",
+              {
+                type: "button",
+                className: "mr-link",
+                "aria-expanded": expanded,
+                disabled,
+                onClick: () => {
+                  props.onToggleDetail(entry);
+                },
+              },
+              expanded ? t("detailHide") : t("detail"),
+            ),
+          createElement(
+            "span",
+            { className: "mr-toggle", title: t("readOnly") },
+            createElement("span", null, t("readOnly")),
+            createElement(Switch, {
+              checked: entry.readOnly,
+              disabled,
+              label: `${t("readOnly")}: ${entry.path}`,
+              onChange: (next) => {
+                props.onToggle(entry, next);
+              },
+            }),
+          ),
+          createElement(
+            "button",
+            {
+              type: "button",
+              className: "mr-delete",
+              "aria-label": `${t("remove")}: ${entry.path}`,
+              title: t("remove"),
+              disabled,
+              onClick: () => {
+                props.onRemove(entry);
+              },
             },
-          },
-          IconTrash(),
+            IconTrash(),
+          ),
         ),
+        entry.kind === "workspace" &&
+          expanded &&
+          createElement(
+            "div",
+            { className: "mr-detail" },
+            createElement("span", { className: "mr-detail-title" }, t("dirsTitle")),
+            ...(entry.dirs ?? []).map((dir) =>
+              createElement(DirRow, {
+                key: dir.path,
+                dir,
+                disabled,
+                t,
+                onOverride: (row: EntryDir, readOnly: boolean | null) => {
+                  props.onOverride(entry, row, readOnly);
+                },
+              }),
+            ),
+            (entry.dirs ?? []).length === 0 &&
+              createElement("span", { className: "mr-dir-path" }, t("empty")),
+          ),
       );
     }
 
@@ -565,6 +721,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState<string | null>(null);
       const [busy, setBusy] = React.useState<boolean>(false);
       const [view, setView] = React.useState<"list" | "workspaces">("list");
+      const [expanded, setExpanded] = React.useState<string | null>(null);
       const [workspaces, setWorkspaces] = React.useState<WorkspaceOption[]>([]);
       const [workspacesLoading, setWorkspacesLoading] = React.useState<boolean>(false);
       const closeRef = React.useRef<HTMLButtonElement | null>(null);
@@ -699,7 +856,19 @@ window.__ModuleLoader__.load({
         void run(() =>
           postJson("dsh-multiple-roots-workspace/read-only", {
             workspacePath,
+            kind: entry.kind,
             path: entry.path,
+            readOnly,
+          }),
+        );
+      };
+
+      const overrideDir = (entry: Entry, dir: EntryDir, readOnly: boolean | null): void => {
+        void run(() =>
+          postJson("dsh-multiple-roots-workspace/overrides", {
+            workspacePath,
+            path: entry.path,
+            dirPath: dir.path,
             readOnly,
           }),
         );
@@ -709,6 +878,7 @@ window.__ModuleLoader__.load({
         void run(() =>
           postJson("dsh-multiple-roots-workspace/remove", {
             workspacePath,
+            kind: entry.kind,
             path: entry.path,
           }),
         );
@@ -771,11 +941,17 @@ window.__ModuleLoader__.load({
                       ),
                       entries.map((entry) =>
                         createElement(EntryRow, {
-                          key: entry.path,
+                          key: `${entry.kind}:${entry.path}`,
                           entry,
+                          expanded: expanded === `${entry.kind}:${entry.path}`,
                           disabled: busy,
                           t,
                           onToggle: toggleReadOnly,
+                          onToggleDetail: (row: Entry) => {
+                            const key = `${row.kind}:${row.path}`;
+                            setExpanded((current) => (current === key ? null : key));
+                          },
+                          onOverride: overrideDir,
                           onRemove: removeEntry,
                         }),
                       ),

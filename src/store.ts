@@ -5,6 +5,11 @@
  * read-modify-write inside one process. The file is replaced atomically through
  * a temporary sibling, so a failed write never publishes partial state.
  *
+ * Schema version 2 stores two row kinds: `folder` rows name one directory,
+ * `workspace` rows reference another workspace (one row, expanded live). Version
+ * 1 rows — the old snapshot rows — load as `folder` rows, which preserves every
+ * path and loses only the provenance that version 1 never recorded reliably.
+ *
  * @module dsh-multiple-roots-workspace/store
  */
 
@@ -13,24 +18,30 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  EntryOverrideLimitError,
   MAX_ENTRIES,
   makeEntry,
   mergeEntries,
   normalizeStoredEntry,
   removeEntry,
+  setEntryOverride,
   setEntryReadOnly,
 } from "./entries";
-import type { Entry, EntrySource } from "./entries";
+import type { Entry, EntryKind } from "./entries";
 import { canonicalizePath, pathKey } from "./paths";
 
 /** Storage schema version written to disk. */
-const STORAGE_VERSION = 1;
+const STORAGE_VERSION = 2;
 
-/** A row merged in from another workspace or from a route body. */
+/** Versions this build can read. */
+const READABLE_VERSIONS = new Set([1, 2]);
+
+/** A row merged in from a route body. */
 export interface IncomingEntry {
+  readonly kind?: EntryKind;
   readonly path: string;
   readonly readOnly?: boolean;
-  readonly source?: EntrySource;
+  readonly overrides?: Readonly<Record<string, boolean>>;
   readonly addedAt?: number;
 }
 
@@ -84,7 +95,18 @@ function emptyData(): StoredData {
 
 /** Whether a value is a non-array object. */
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object";
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Serialize one row, omitting empty overrides and the folder kind default. */
+function serializeEntry(entry: Entry): Record<string, unknown> {
+  return {
+    kind: entry.kind,
+    path: entry.path,
+    readOnly: entry.readOnly,
+    ...(Object.keys(entry.overrides).length === 0 ? {} : { overrides: entry.overrides }),
+    addedAt: entry.addedAt,
+  };
 }
 
 export class MultipleRootsStore {
@@ -113,7 +135,7 @@ export class MultipleRootsStore {
   }
 
   /**
-   * Attach one existing directory.
+   * Attach one existing directory as a folder row.
    * @param workspacePath - owning workspace directory.
    * @param folderPath - directory to attach; any spelling of an existing directory.
    * @returns the complete row list.
@@ -129,13 +151,43 @@ export class MultipleRootsStore {
       );
     }
     const current = this.entriesFor(workspace);
-    if (current.some((entry) => pathKey(entry.path) === pathKey(folder))) return current;
-    return this.commit(workspace, mergeEntries(current, [makeEntry(folder)]));
+    if (
+      current.some((entry) => entry.kind === "folder" && pathKey(entry.path) === pathKey(folder))
+    ) {
+      return current;
+    }
+    return this.commit(workspace, mergeEntries(current, [makeEntry(folder, { kind: "folder" })]));
   }
 
   /**
-   * Merge rows (for example another workspace's root plus its attached
-   * folders) into one workspace.
+   * Attach another workspace as one reference row. Its own rows are expanded
+   * live at read time; they are never copied.
+   * @param workspacePath - owning workspace directory.
+   * @param sourceWorkspacePath - workspace whose root becomes the referenced directory.
+   * @returns the complete row list.
+   * @throws {MultipleRootsError} on invalid, missing, non-directory, primary, or over-limit input.
+   */
+  addWorkspace(workspacePath: unknown, sourceWorkspacePath: unknown): Entry[] {
+    const workspace = this.requireWorkspace(workspacePath);
+    const source = this.requireDirectory(sourceWorkspacePath);
+    if (pathKey(source) === pathKey(workspace)) {
+      throw new MultipleRootsError("primary", "A workspace cannot be attached to itself.");
+    }
+    const current = this.entriesFor(workspace);
+    if (
+      current.some((entry) => entry.kind === "workspace" && pathKey(entry.path) === pathKey(source))
+    ) {
+      return current;
+    }
+    return this.commit(
+      workspace,
+      mergeEntries(current, [makeEntry(source, { kind: "workspace" })]),
+    );
+  }
+
+  /**
+   * Merge rows merged from a route body (kept for the tests' convenience and
+   * for forwarding a client-built list).
    * @param workspacePath - owning workspace directory.
    * @param incoming - rows to merge.
    * @returns the complete row list.
@@ -157,23 +209,72 @@ export class MultipleRootsStore {
   }
 
   /**
-   * Set one row's read-only flag.
+   * Set one row's read-only switch.
    * @param workspacePath - owning workspace directory.
+   * @param kind - row kind.
    * @param entryPath - canonical path named by the row.
    * @param readOnly - requested state.
    * @returns the complete row list.
    * @throws {MultipleRootsError} when the workspace or row is unknown.
    */
-  setReadOnly(workspacePath: unknown, entryPath: unknown, readOnly: boolean): Entry[] {
+  setReadOnly(
+    workspacePath: unknown,
+    kind: unknown,
+    entryPath: unknown,
+    readOnly: boolean,
+  ): Entry[] {
     const workspace = this.requireWorkspace(workspacePath);
+    const rowKind = this.requireKind(kind);
     const current = this.entriesFor(workspace);
-    const target = this.matchEntry(current, entryPath);
+    const target = this.matchEntry(current, rowKind, entryPath);
     if (target === undefined)
       throw new MultipleRootsError(
         "unknown-entry",
         `No attached folder "${String(entryPath)}" in this workspace.`,
       );
-    const result = setEntryReadOnly(current, target, readOnly === true);
+    const result = setEntryReadOnly(current, rowKind, target, readOnly === true);
+    if (!result.changed) return current;
+    return this.commit(workspace, result.entries);
+  }
+
+  /**
+   * Set or clear one per-directory override on a workspace row.
+   * @param workspacePath - owning workspace directory.
+   * @param rowPath - canonical path of the workspace row.
+   * @param directory - directory the override names.
+   * @param readOnly - requested state, or `null` to follow inheritance again.
+   * @returns the complete row list.
+   * @throws {MultipleRootsError} when the workspace or row is unknown.
+   */
+  setOverride(
+    workspacePath: unknown,
+    rowPath: unknown,
+    directory: unknown,
+    readOnly: boolean | null,
+  ): Entry[] {
+    const workspace = this.requireWorkspace(workspacePath);
+    const current = this.entriesFor(workspace);
+    const target = this.matchEntry(current, "workspace", rowPath);
+    if (target === undefined)
+      throw new MultipleRootsError(
+        "unknown-entry",
+        `No attached workspace "${String(rowPath)}" in this workspace.`,
+      );
+    const canonical = canonicalizePath(directory);
+    if (canonical === undefined)
+      throw new MultipleRootsError(
+        "invalid-path",
+        "An overridden directory must be an absolute path.",
+      );
+    let result: { readonly entries: Entry[]; readonly changed: boolean };
+    try {
+      result = setEntryOverride(current, target, canonical, readOnly === true ? true : readOnly);
+    } catch (error) {
+      if (error instanceof EntryOverrideLimitError) {
+        throw new MultipleRootsError("limit", error.message);
+      }
+      throw error;
+    }
     if (!result.changed) return current;
     return this.commit(workspace, result.entries);
   }
@@ -181,16 +282,18 @@ export class MultipleRootsStore {
   /**
    * Detach one row. Missing rows are idempotent no-ops.
    * @param workspacePath - owning workspace directory.
+   * @param kind - row kind.
    * @param entryPath - canonical path named by the row.
    * @returns the complete row list.
    * @throws {MultipleRootsError} when the workspace is unknown.
    */
-  remove(workspacePath: unknown, entryPath: unknown): Entry[] {
+  remove(workspacePath: unknown, kind: unknown, entryPath: unknown): Entry[] {
     const workspace = this.requireWorkspace(workspacePath);
+    const rowKind = this.requireKind(kind);
     const current = this.entriesFor(workspace);
-    const target = this.matchEntry(current, entryPath);
+    const target = this.matchEntry(current, rowKind, entryPath);
     if (target === undefined) return current;
-    return this.commit(workspace, removeEntry(current, target));
+    return this.commit(workspace, removeEntry(current, rowKind, target));
   }
 
   /** The workspace's canonical spelling, creating neither. */
@@ -201,6 +304,13 @@ export class MultipleRootsStore {
       "invalid-workspace",
       "A workspace path must be an absolute directory path.",
     );
+  }
+
+  /** Validate a row-kind argument; an absent kind means a folder row. */
+  private requireKind(kind: unknown): EntryKind {
+    if (kind === undefined || kind === null || kind === "folder") return "folder";
+    if (kind === "workspace") return "workspace";
+    throw new MultipleRootsError("invalid-kind", `Unknown attached row kind: "${String(kind)}".`);
   }
 
   /** Canonical spelling plus the existing storage key, when one is stored. */
@@ -235,11 +345,17 @@ export class MultipleRootsStore {
     return canonical;
   }
 
-  /** Match a row by canonical path, accepting either spelling. */
-  private matchEntry(entries: readonly Entry[], entryPath: unknown): string | undefined {
+  /** Match a row by kind and canonical path, accepting either spelling. */
+  private matchEntry(
+    entries: readonly Entry[],
+    kind: EntryKind,
+    entryPath: unknown,
+  ): string | undefined {
     const canonical = canonicalizePath(entryPath);
     if (canonical === undefined) return undefined;
-    return entries.find((entry) => pathKey(entry.path) === pathKey(canonical))?.path;
+    return entries.find(
+      (entry) => entry.kind === kind && pathKey(entry.path) === pathKey(canonical),
+    )?.path;
   }
 
   /** Persist a complete list and return it. */
@@ -291,6 +407,13 @@ export class MultipleRootsStore {
       return emptyData();
     }
     if (!isRecord(parsed)) return emptyData();
+    const version = typeof parsed.version === "number" ? parsed.version : STORAGE_VERSION;
+    if (!READABLE_VERSIONS.has(version)) {
+      this.warn(
+        `multiple-roots: ignoring ${this.filePath} with unsupported schema version ${String(version)}`,
+      );
+      return emptyData();
+    }
     const stored = parsed.workspaces;
     if (!isRecord(stored)) return emptyData();
     const workspaces: Record<string, StoredWorkspace> = {};
@@ -310,7 +433,16 @@ export class MultipleRootsStore {
   private save(): void {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const temporary = `${this.filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, `${JSON.stringify(this.data, null, 2)}\n`, "utf8");
+    const document = {
+      version: STORAGE_VERSION,
+      workspaces: Object.fromEntries(
+        Object.entries(this.data.workspaces).map(([root, value]) => [
+          root,
+          { entries: value.entries.map(serializeEntry) },
+        ]),
+      ),
+    };
+    fs.writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, "utf8");
     fs.renameSync(temporary, this.filePath);
   }
 }

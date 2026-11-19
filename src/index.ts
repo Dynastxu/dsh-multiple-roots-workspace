@@ -1,17 +1,23 @@
 /**
  * dsh-multiple-roots-workspace — host half.
  *
- * A workspace owns an ordered list of attached folders. Each row is either
- * writable or read-only:
- *  - writable rows enter every live Session's `workspace-write` set through
- *    `ctx.sandboxPolicy.registerWritableRoot(session, directory)`;
- *  - read-only rows are never granted, and `ctx.tools.guard()` denies file
- *    mutations that land inside them (the path is inside the primary workspace
- *    or another attached row often enough to matter).
- *  - the list reaches the model as a runtime-context contribution that renders
- *    `''` when the workspace has no rows, so a workspace without attached
- *    folders never injects it. The agent loop commits one snapshot per change,
- *    which is exactly "once at conversation start, again only when it changes".
+ * A workspace owns an ordered list of rows. Each row is one of:
+ *  - a `folder` row: one attached directory with its own read-only switch;
+ *  - a `workspace` row: one reference to another workspace, expanded live into
+ *    that workspace's root plus everything its own list contributes (with cycle
+ *    detection). It is never a snapshot: later changes in the referenced
+ *    workspace show up without re-attaching.
+ *
+ * The effective directory list is recomputed from storage on every read:
+ *  - writable, existing directories enter every live Session's `workspace-write`
+ *    set through `ctx.sandboxPolicy.registerWritableRoot(session, directory)`;
+ *  - read-only directories are never granted, and `ctx.tools.guard()` denies
+ *    file mutations that land inside them;
+ *  - missing directories are skipped by the model-facing contribution (and by
+ *    grants), while the dialog reports them as missing;
+ *  - the model sees the list as a runtime-context contribution that renders
+ *    `''` when nothing is left, so a workspace without attached directories
+ *    never injects the section. The agent loop commits one snapshot per change.
  *
  * The Client half talks to the routes below; both call the same store.
  *
@@ -20,9 +26,14 @@
 
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
 
-import { findReadOnlyViolation, renderContext, writablePaths } from "./entries";
-import type { Entry } from "./entries";
-import { canonicalizePath, pathKey } from "./paths";
+import {
+  expandAttachedWorkspace,
+  expandEntries,
+  findReadOnlyViolation,
+  renderContext,
+} from "./entries";
+import type { DirectoryView, Entry, EntryKind } from "./entries";
+import { canonicalizePath, isExistingDirectory, pathKey } from "./paths";
 import { MultipleRootsError, MultipleRootsStore } from "./store";
 import { service } from "./types";
 import type {
@@ -49,6 +60,7 @@ const ROUTES = {
   addFolder: `${PREFIX}/add-folder`,
   addWorkspace: `${PREFIX}/add-workspace`,
   readOnly: `${PREFIX}/read-only`,
+  overrides: `${PREFIX}/overrides`,
   remove: `${PREFIX}/remove`,
 } as const;
 
@@ -56,11 +68,26 @@ const CONTEXT_NAME = "multiple-roots:folders";
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_WORKSPACE_LIST = 500;
 
-/** One row on the wire to the Client. */
-interface WireEntry {
+/** One directory inside an attached workspace, as the Client sees it. */
+interface WireDir {
   readonly path: string;
   readonly readOnly: boolean;
-  readonly source: Entry["source"];
+  readonly exists: boolean;
+  readonly overridden: boolean;
+}
+
+/** One row on the wire to the Client. */
+interface WireEntry {
+  readonly kind: EntryKind;
+  readonly path: string;
+  /** The row's own switch (a folder row's flag, or a workspace row's blanket). */
+  readonly readOnly: boolean;
+  /** Whether the row's own directory (folder or attached workspace root) exists. */
+  readonly exists: boolean;
+  /** How many directories this row currently contributes are missing. */
+  readonly missing: number;
+  /** Expanded directories; present for workspace rows only. */
+  readonly dirs?: readonly WireDir[];
 }
 
 /** One live grant owned by this plugin for a Session. */
@@ -134,15 +161,6 @@ function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>
   });
 }
 
-/** Project rows to the small wire form the Client renders. */
-function wireEntries(entries: readonly Entry[]): WireEntry[] {
-  return entries.map((entry) => ({
-    path: entry.path,
-    readOnly: entry.readOnly,
-    source: entry.source,
-  }));
-}
-
 /** The plugin entry point. */
 export function apply(ctx: PluginContext): void {
   const warn = (message: string): void => {
@@ -158,6 +176,13 @@ export function apply(ctx: PluginContext): void {
   const grants = new Map<string, Map<string, Grant>>();
   /** sessionId -> canonical workspace directory */
   const sessionRoots = new Map<string, string>();
+
+  /** Stored rows of any workspace, for expansion. */
+  const rowsOf = (workspace: string): readonly Entry[] => store.entriesFor(workspace);
+
+  /** The directories one workspace currently contributes, missing ones included. */
+  const resolveDirs = (workspace: string): DirectoryView[] =>
+    expandEntries(rowsOf, workspace, { exists: isExistingDirectory });
 
   /** Canonical workspace directory of one Session, cached for its lifetime. */
   const workspaceOf = (session: SessionLike | undefined): string | undefined => {
@@ -188,14 +213,19 @@ export function apply(ctx: PluginContext): void {
   };
 
   /**
-   * Bring one Session's grants in line with its workspace's rows. Runs on each
-   * pre-step, so resume, fork, and a plugin reload all converge without a
-   * separate lifecycle registry.
+   * Bring one Session's grants in line with its workspace's effective rows.
+   * Runs on each pre-step, so resume, fork, and a plugin reload all converge
+   * without a separate lifecycle registry.
    */
   const syncSession = (session: SessionLike): void => {
     const id = session.id;
     const workspace = workspaceOf(session);
-    const desired = workspace === undefined ? [] : writablePaths(store.entriesFor(workspace));
+    const desired =
+      workspace === undefined
+        ? []
+        : resolveDirs(workspace)
+            .filter((directory) => directory.existing && !directory.readOnly)
+            .map((directory) => directory.path);
     if (desired.length === 0) {
       dropSessionGrants(id);
       return;
@@ -304,7 +334,8 @@ export function apply(ctx: PluginContext): void {
 
   // Read-only rows deny file mutations even when a broader grant would allow
   // them. A guard is monotonic: no later listener can turn the denial back into
-  // permission.
+  // permission. Missing directories are skipped: a mutation cannot land there,
+  // and a stale read-only root must not block writes elsewhere.
   ctx.inject(["tools"], (scope) => {
     const tools = service<ToolsService>(scope, "tools");
     if (tools === undefined) return;
@@ -315,8 +346,15 @@ export function apply(ctx: PluginContext): void {
           if (session === undefined) return undefined;
           const workspace = workspaceOf(session);
           if (workspace === undefined) return undefined;
-          const entries = store.entriesFor(workspace);
-          if (!entries.some((entry) => entry.readOnly)) return undefined;
+          let readOnly: DirectoryView[];
+          try {
+            readOnly = resolveDirs(workspace).filter(
+              (directory) => directory.existing && directory.readOnly,
+            );
+          } catch (error) {
+            return `Blocked by multiple-roots: cannot resolve the attached folders (${describeError(error)}).`;
+          }
+          if (readOnly.length === 0) return undefined;
           // Match how the file tools resolve relative targets: the committed
           // working directory, not necessarily the immutable Session cwd.
           const workingDirectory = service<WorkingDirectoryService>(ctx, "workingDirectory");
@@ -327,7 +365,7 @@ export function apply(ctx: PluginContext): void {
             (typeof session.header.cwd === "string" ? session.header.cwd : process.cwd());
           let violation;
           try {
-            violation = findReadOnlyViolation(execution.name, execution.arguments, cwd, entries);
+            violation = findReadOnlyViolation(execution.name, execution.arguments, cwd, readOnly);
           } catch (error) {
             // A check that cannot establish the target may not silently allow the
             // mutation: the row's read-only intent is the stronger promise here.
@@ -343,9 +381,8 @@ export function apply(ctx: PluginContext): void {
     );
   });
 
-  // The model-facing surface. An empty row list renders `''`, which the prompt
-  // registry drops, so the runtime-context snapshot never mentions this plugin
-  // until the workspace actually has attached folders.
+  // The model-facing surface. Only existing directories are rendered; an empty
+  // effective list renders `''`, which the prompt registry drops.
   ctx.inject(["systemPrompt"], (scope) => {
     const systemPrompt = service<SystemPromptService>(scope, "systemPrompt");
     if (systemPrompt === undefined) return;
@@ -367,7 +404,7 @@ export function apply(ctx: PluginContext): void {
               if (session === undefined) return "";
               const workspace = workspaceOf(session);
               if (workspace === undefined) return "";
-              return renderContext(store.entriesFor(workspace));
+              return renderContext(resolveDirs(workspace));
             } catch {
               return "";
             }
@@ -452,22 +489,70 @@ export function apply(ctx: PluginContext): void {
     return canonical;
   };
 
-  /** Common mutation response: persist already happened, then grant fan-out. */
-  const respondEntries = (
-    response: ServerResponse,
+  /** One stored row projected for the Client, with live existence and detail. */
+  const wireRow = (
     workspace: string,
-    entries: readonly Entry[],
-  ): void => {
+    row: Entry,
+    effective: ReadonlyMap<string, DirectoryView>,
+  ): WireEntry => {
+    const existsNow = isExistingDirectory(row.path);
+    if (row.kind === "folder") {
+      return {
+        kind: "folder",
+        path: row.path,
+        readOnly: row.readOnly,
+        exists: existsNow,
+        missing: existsNow ? 0 : 1,
+      };
+    }
+    let detail: DirectoryView[];
+    try {
+      detail = expandAttachedWorkspace(rowsOf, workspace, row.path, {
+        exists: isExistingDirectory,
+      });
+    } catch {
+      detail = [];
+    }
+    const dirs = detail.map((view) => {
+      const resolved = effective.get(pathKey(view.path)) ?? view;
+      return {
+        path: resolved.path,
+        readOnly: resolved.readOnly,
+        exists: resolved.existing,
+        overridden: resolved.overridden,
+      };
+    });
+    return {
+      kind: "workspace",
+      path: row.path,
+      readOnly: row.readOnly,
+      exists: existsNow,
+      missing: dirs.filter((directory) => !directory.exists).length,
+      dirs,
+    };
+  };
+
+  /** The dialog's complete state for one workspace. */
+  const statePayload = (
+    workspace: string,
+  ): { readonly workspacePath: string; readonly entries: WireEntry[] } => {
+    const effective = new Map(
+      resolveDirs(workspace).map((directory) => [pathKey(directory.path), directory]),
+    );
+    return {
+      workspacePath: workspace,
+      entries: store.entriesFor(workspace).map((row) => wireRow(workspace, row, effective)),
+    };
+  };
+
+  /** Common mutation response: persist already happened, then grant fan-out. */
+  const respondEntries = (response: ServerResponse, workspace: string): void => {
     try {
       syncWorkspace(workspace);
     } catch (error) {
       warn(`multiple-roots: cannot sync live sessions: ${describeError(error)}`);
     }
-    sendJson(response, 200, {
-      ok: true,
-      workspacePath: workspace,
-      entries: wireEntries(entries),
-    });
+    sendJson(response, 200, { ok: true, ...statePayload(workspace) });
   };
 
   /** Map an operation error to its HTTP answer. */
@@ -501,11 +586,7 @@ export function apply(ctx: PluginContext): void {
             try {
               const url = new URL(request.url ?? "/", "http://127.0.0.1");
               const workspace = requireTarget(url.searchParams.get("workspacePath"));
-              sendJson(response, 200, {
-                ok: true,
-                workspacePath: workspace,
-                entries: wireEntries(store.entriesFor(workspace)),
-              });
+              sendJson(response, 200, { ok: true, ...statePayload(workspace) });
             } catch (error) {
               fail(response, error);
             }
@@ -553,8 +634,8 @@ export function apply(ctx: PluginContext): void {
             try {
               const body = await readJsonBody(request);
               const workspace = requireTarget(body.workspacePath);
-              const entries = store.addFolder(workspace, body.path);
-              respondEntries(response, workspace, entries);
+              store.addFolder(workspace, body.path);
+              respondEntries(response, workspace);
             } catch (error) {
               fail(response, error);
             }
@@ -578,20 +659,8 @@ export function apply(ctx: PluginContext): void {
               const body = await readJsonBody(request);
               const workspace = requireTarget(body.workspacePath);
               const source = requireTarget(body.sourceWorkspacePath);
-              if (pathKey(source) === pathKey(workspace)) {
-                throw new MultipleRootsError(
-                  "primary",
-                  "A workspace cannot be attached to itself.",
-                );
-              }
-              const inherited = store
-                .entriesFor(source)
-                .map((entry) => ({ ...entry, source: "workspace" as const }));
-              const entries = store.addEntries(workspace, [
-                { path: source, readOnly: false, source: "workspace" },
-                ...inherited,
-              ]);
-              respondEntries(response, workspace, entries);
+              store.addWorkspace(workspace, source);
+              respondEntries(response, workspace);
             } catch (error) {
               fail(response, error);
             }
@@ -617,14 +686,42 @@ export function apply(ctx: PluginContext): void {
                 throw new MultipleRootsError("invalid-body", "readOnly must be a boolean.");
               }
               const workspace = requireTarget(body.workspacePath);
-              const entries = store.setReadOnly(workspace, body.path, body.readOnly);
-              respondEntries(response, workspace, entries);
+              store.setReadOnly(workspace, body.kind, body.path, body.readOnly);
+              respondEntries(response, workspace);
             } catch (error) {
               fail(response, error);
             }
           },
         }),
       "multiple-roots: read-only route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.overrides,
+          handler: async (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "POST") {
+              sendJson(response, 405, { ok: false, error: "POST only." });
+              return;
+            }
+            try {
+              const body = await readJsonBody(request);
+              const readOnly = body.readOnly;
+              if (readOnly !== null && typeof readOnly !== "boolean") {
+                throw new MultipleRootsError("invalid-body", "readOnly must be a boolean or null.");
+              }
+              const workspace = requireTarget(body.workspacePath);
+              store.setOverride(workspace, body.path, body.dirPath, readOnly);
+              respondEntries(response, workspace);
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: override route",
     );
 
     scope.effect(
@@ -641,8 +738,8 @@ export function apply(ctx: PluginContext): void {
             try {
               const body = await readJsonBody(request);
               const workspace = requireTarget(body.workspacePath);
-              const entries = store.remove(workspace, body.path);
-              respondEntries(response, workspace, entries);
+              store.remove(workspace, body.kind, body.path);
+              respondEntries(response, workspace);
             } catch (error) {
               fail(response, error);
             }

@@ -39,17 +39,17 @@ beforeAll(() => {
   for (const directory of [workspace, otherWorkspace, folderA, folderB]) mkdirSync(directory);
   originalHome = process.env.DSH_HOME;
   process.env.DSH_HOME = path.join(root, "home");
-  // The other workspace already owns a read-only attachment, which an
-  // "add workspace" action must inherit.
+  // The other workspace already owns a read-only attachment, which a live
+  // workspace reference must keep honoring.
   const storage = path.join(process.env.DSH_HOME, "storages", "multiple-roots-workspace.json");
   mkdirSync(path.dirname(storage), { recursive: true });
   writeFileSync(
     storage,
     JSON.stringify({
-      version: 1,
+      version: 2,
       workspaces: {
         [otherWorkspace]: {
-          entries: [{ path: folderB, readOnly: true, source: "folder", addedAt: 1 }],
+          entries: [{ kind: "folder", path: folderB, readOnly: true, addedAt: 1 }],
         },
       },
     }),
@@ -68,10 +68,19 @@ type PreStepListener = (
 ) => Promise<unknown>;
 type DisposedListener = (session: SessionLike) => void;
 
+interface RouteEntry {
+  readonly kind: "folder" | "workspace";
+  readonly path: string;
+  readonly readOnly: boolean;
+  readonly exists: boolean;
+  readonly missing: number;
+  readonly dirs?: { readonly path: string; readonly readOnly: boolean; readonly exists: boolean }[];
+}
+
 interface RouteResult {
   readonly ok?: boolean;
   readonly error?: string;
-  readonly entries?: { path: string; readOnly: boolean; source: string }[];
+  readonly entries?: RouteEntry[];
   readonly workspaces?: WorkspaceRow[];
 }
 
@@ -161,9 +170,8 @@ async function callRoute(
 }
 
 describe("plugin composition", () => {
-  it("grants, guards, prompts, and routes through one workspace state", async () => {
-    const granted: string[] = [];
-    const disposed: string[] = [];
+  it("grants, expands, guards, prompts, and routes through one live workspace state", async () => {
+    const active = new Set<string>();
     const agent: AgentLike = {
       session: { id: "session-1", header: { cwd: workspace } },
     };
@@ -183,9 +191,9 @@ describe("plugin composition", () => {
         "sandboxPolicy",
         {
           registerWritableRoot(_session, directory) {
-            granted.push(directory);
+            active.add(directory);
             return () => {
-              disposed.push(directory);
+              active.delete(directory);
             };
           },
         } satisfies SandboxPolicyService,
@@ -231,9 +239,23 @@ describe("plugin composition", () => {
     const fake = createFakeContext(services);
     apply(fake.ctx);
 
+    const preStep = fake.listeners.preStep;
+    const step = async (): Promise<void> => {
+      await preStep?.({ agent }, async () => ({ kind: "enter", messages: [] }));
+    };
+    const state = async (): Promise<RouteResult> =>
+      (
+        await callRoute(
+          routes.get("/dsh-multiple-roots-workspace/state") as WebRouteLike["handler"],
+          {
+            url: `/dsh-multiple-roots-workspace/state?workspacePath=${encodeURIComponent(workspace)}`,
+          },
+        )
+      ).json;
+
     // No rows: no prompt contribution, no grants.
     expect(registrations.context?.text({ agent })).toBe("");
-    expect(granted).toEqual([]);
+    expect(active.size).toBe(0);
 
     // Add a folder through the same route the Client uses.
     const added = await callRoute(
@@ -244,45 +266,47 @@ describe("plugin composition", () => {
       },
     );
     expect(added.status).toBe(200);
-    expect(added.json.ok).toBe(true);
-    expect(added.json.entries?.map((entry) => entry.path)).toEqual([folderA]);
-    expect(granted).toEqual([folderA]);
+    expect(added.json.entries?.map((entry) => [entry.kind, entry.path])).toEqual([
+      ["folder", folderA],
+    ]);
+    expect(active.has(folderA)).toBe(true);
     expect(registrations.context?.text({ agent })).toContain(folderA);
 
     // Toggle read-only: the grant is released and the prompt marks the row.
-    const toggled = await callRoute(
+    await callRoute(
       routes.get("/dsh-multiple-roots-workspace/read-only") as WebRouteLike["handler"],
       {
         method: "POST",
-        body: { workspacePath: workspace, path: folderA, readOnly: true },
+        body: { workspacePath: workspace, kind: "folder", path: folderA, readOnly: true },
       },
     );
-    expect(toggled.json.entries?.[0]?.readOnly).toBe(true);
-    expect(disposed).toEqual([folderA]);
+    expect(active.has(folderA)).toBe(false);
     expect(registrations.context?.text({ agent })).toContain("(read-only)");
-    const denial = registrations.guard?.({
-      name: "write",
-      arguments: { file_path: path.join(folderA, "new.txt") },
-      agent,
-    });
-    expect(typeof denial).toBe("string");
-    expect(denial).toContain("read-only");
+    expect(
+      registrations.guard?.({
+        name: "write",
+        arguments: { file_path: path.join(folderA, "new.txt") },
+        agent,
+      }),
+    ).toContain("read-only");
 
-    // Adding a workspace inherits its root and its attached rows (with levels).
-    const inherited = await callRoute(
+    // Attaching a workspace stores ONE reference row and expands it live.
+    const attached = await callRoute(
       routes.get("/dsh-multiple-roots-workspace/add-workspace") as WebRouteLike["handler"],
       {
         method: "POST",
         body: { workspacePath: workspace, sourceWorkspacePath: otherWorkspace },
       },
     );
-    expect(inherited.status).toBe(200);
-    expect(inherited.json.entries?.map((entry) => [entry.path, entry.readOnly])).toEqual([
-      [folderA, true],
-      [otherWorkspace, false],
-      [folderB, true],
+    expect(attached.status).toBe(200);
+    expect(attached.json.entries?.map((entry) => [entry.kind, entry.path])).toEqual([
+      ["folder", folderA],
+      ["workspace", otherWorkspace],
     ]);
-    expect(granted).toEqual([folderA, otherWorkspace]);
+    expect(active.has(otherWorkspace)).toBe(true);
+    // The referenced workspace's own read-only row is honored.
+    expect(active.has(folderB)).toBe(false);
+    expect(registrations.context?.text({ agent })).toContain(folderB);
     expect(
       registrations.guard?.({
         name: "edit",
@@ -291,11 +315,122 @@ describe("plugin composition", () => {
       }),
     ).toContain("read-only");
 
-    // The pre-step sync is idempotent and revives grants after a disposal.
-    const preStep = fake.listeners.preStep;
-    expect(preStep).toBeDefined();
-    await preStep?.({ agent }, async () => ({ kind: "enter", messages: [] }));
-    expect(granted).toEqual([folderA, otherWorkspace]);
+    // The dialog reports live existence per row and per expanded directory.
+    const beforeDelete = await state();
+    const attachedRow = beforeDelete.entries?.find((entry) => entry.kind === "workspace");
+    expect(attachedRow?.exists).toBe(true);
+    expect(attachedRow?.missing).toBe(0);
+    expect(attachedRow?.dirs?.map((dir) => dir.path)).toEqual([otherWorkspace, folderB]);
+
+    // Deleting a source folder: injection skips it, the grant set is unchanged
+    // (it was read-only), and the dialog marks the workspace blob as partial.
+    rmSync(folderB, { recursive: true, force: true });
+    await step();
+    expect(registrations.context?.text({ agent })).not.toContain(folderB);
+    expect(active.has(otherWorkspace)).toBe(true);
+    const afterDelete = await state();
+    expect(afterDelete.entries?.find((entry) => entry.kind === "workspace")?.missing).toBe(1);
+    expect(
+      afterDelete.entries
+        ?.find((entry) => entry.kind === "workspace")
+        ?.dirs?.find((dir) => dir.path === folderB)?.exists,
+    ).toBe(false);
+
+    // The directory coming back is picked up again without re-attaching.
+    mkdirSync(folderB);
+    await step();
+    expect(registrations.context?.text({ agent })).toContain(folderB);
+
+    // A per-directory override can make the inherited read-only folder writable.
+    await callRoute(
+      routes.get("/dsh-multiple-roots-workspace/overrides") as WebRouteLike["handler"],
+      {
+        method: "POST",
+        body: {
+          workspacePath: workspace,
+          path: otherWorkspace,
+          dirPath: folderB,
+          readOnly: false,
+        },
+      },
+    );
+    expect(active.has(folderB)).toBe(true);
+    const overrideState = await state();
+    expect(
+      overrideState.entries
+        ?.find((entry) => entry.kind === "workspace")
+        ?.dirs?.find((dir) => dir.path === folderB),
+    ).toMatchObject({ readOnly: false });
+
+    // The workspace row's blanket switch turns the rest of the subtree
+    // read-only; the per-directory override keeps its own answer.
+    await callRoute(
+      routes.get("/dsh-multiple-roots-workspace/read-only") as WebRouteLike["handler"],
+      {
+        method: "POST",
+        body: { workspacePath: workspace, kind: "workspace", path: otherWorkspace, readOnly: true },
+      },
+    );
+    expect(active.has(otherWorkspace)).toBe(false);
+    expect(active.has(folderB)).toBe(true);
+    expect(
+      registrations.guard?.({
+        name: "write",
+        arguments: { file_path: path.join(otherWorkspace, "x") },
+        agent,
+      }),
+    ).toContain("read-only");
+
+    // An explicit writable folder row for the same directory wins.
+    await callRoute(
+      routes.get("/dsh-multiple-roots-workspace/add-folder") as WebRouteLike["handler"],
+      {
+        method: "POST",
+        body: { workspacePath: workspace, path: otherWorkspace },
+      },
+    );
+    expect(active.has(otherWorkspace)).toBe(true);
+    expect(active.has(folderB)).toBe(true);
+
+    // Removing the workspace row leaves the explicit folder row behind.
+    await callRoute(routes.get("/dsh-multiple-roots-workspace/remove") as WebRouteLike["handler"], {
+      method: "POST",
+      body: { workspacePath: workspace, kind: "workspace", path: otherWorkspace },
+    });
+    const remaining = await state();
+    expect(remaining.entries?.map((entry) => [entry.kind, entry.path])).toEqual([
+      ["folder", folderA],
+      ["folder", otherWorkspace],
+    ]);
+    expect(registrations.context?.text({ agent })).not.toContain(folderB);
+    expect(active.has(folderB)).toBe(false);
+
+    // A missing folder row stays listed with exists=false.
+    rmSync(folderA, { recursive: true, force: true });
+    const missingState = await state();
+    expect(missingState.entries?.find((entry) => entry.path === folderA)).toMatchObject({
+      exists: false,
+      missing: 1,
+    });
+    mkdirSync(folderA);
+
+    // Unknown workspaces and wrong row kinds are rejected, not silently stored.
+    const unknown = await callRoute(
+      routes.get("/dsh-multiple-roots-workspace/add-workspace") as WebRouteLike["handler"],
+      {
+        method: "POST",
+        body: { workspacePath: workspace, sourceWorkspacePath: path.join(root, "ghost") },
+      },
+    );
+    expect(unknown.status).toBe(400);
+    const wrongKind = await callRoute(
+      routes.get("/dsh-multiple-roots-workspace/overrides") as WebRouteLike["handler"],
+      {
+        method: "POST",
+        body: { workspacePath: workspace, path: folderA, dirPath: folderA, readOnly: true },
+      },
+    );
+    expect(wrongKind.status).toBe(400);
 
     // An unadmitted request never reaches the store.
     connection.requestRejection = () => 401;
@@ -309,12 +444,11 @@ describe("plugin composition", () => {
     expect(rejected.json.ok).toBe(false);
 
     // Session disposal releases that Session's registrations.
-    const before = disposed.length;
     fake.listeners.disposed?.(agent.session);
-    expect(disposed.length).toBeGreaterThanOrEqual(before + 1);
+    expect(active.size).toBe(0);
 
     // Plugin teardown releases whatever remains.
     for (const dispose of [...fake.effects].reverse()) dispose();
-    expect(disposed).toContain(otherWorkspace);
+    expect(fake.warnings).toEqual([]);
   });
 });
