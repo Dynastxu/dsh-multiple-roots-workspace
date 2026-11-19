@@ -20,6 +20,11 @@ dsh plugin --profile desktop add /absolute/path/to/dsh-multiple-roots-workspace
 
 A local-directory install links the checkout; restart DSH or reload the page after changing the Host or Client files.
 
+## Requirements
+
+- **DSH `>=0.2.2-rc.2`.** That is the first release containing `SandboxPolicyService.registerWritableRoot` (commit `f5dea38671`, 2026-10-26; first tagged in `dsh-v0.2.2-rc.2`). Earlier releases do not expose the session-scoped writable-root API the grants rely on. The other DSH APIs used here pre-date it: the context-menu service first shipped in `0.2.2-alpha.3`, and the shell overlay, directory picker, web-server routes, and workspace registry in `0.2.1-rc.2`. The declaration lives in `engines.dsh`, which the plugin manager evaluates before installing or starting the bundle.
+- **Node `>=22.19`** for building and testing the sources; the installed bundle itself runs inside DSH's Node runtime.
+
 ## Usage
 
 1. Hover a workspace row in the sidebar and open its `…` menu.
