@@ -10,12 +10,12 @@ A DeepSeek Harness bundle that attaches extra folders — or another workspace's
 
 ## Install
 
-From the DSH Plugins page: **Add plugin** → choose this directory.
+From the DSH Plugins page: **Add plugin** → @dynastxu/dsh-multiple-roots-workspace.
 
 Or from the bundled `dsh` CLI:
 
 ```sh
-dsh plugin --profile desktop add /absolute/path/to/dsh-multiple-roots-workspace
+dsh plugin --profile desktop add @dynastxu/dsh-multiple-roots-workspace
 ```
 
 A local-directory install links the checkout; restart DSH or reload the page after changing the Host or Client files.

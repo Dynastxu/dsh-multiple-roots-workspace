@@ -70,5 +70,11 @@
         "@deepseek-ai/dsh-client-locale"
       ]
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dynastxu/dsh-multiple-roots-workspace.git"
+  },
+  "homepage": "https://github.com/Dynastxu/dsh-multiple-roots-workspace",
+  "bugs": "https://github.com/Dynastxu/dsh-multiple-roots-workspace/issues"
 }
