@@ -1,0 +1,5 @@
+# Cordis patch for dsh-multiple-roots-workspace. The bundle inserts its Host
+# row; profiles can target the same id from their own patch layer.
+- insert:
+    - id: multiple-roots-workspace
+      name: "@dynastxu/dsh-multiple-roots-workspace"

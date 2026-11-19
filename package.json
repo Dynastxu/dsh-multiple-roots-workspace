@@ -1,34 +1,75 @@
 {
   "name": "@dynastxu/dsh-multiple-roots-workspace",
-  "version": "0.0.0",
-  "description": "",
+  "version": "0.1.0",
+  "description": "Attach extra folders, or another workspace's folders, to a DeepSeek Harness workspace with per-folder read-only control.",
   "keywords": [
+    "deepseek-harness",
     "dsh",
-    "dsh-plugin"
+    "dsh-plugin",
+    "multi-root",
+    "sandbox",
+    "workspace",
+    "writable-root"
   ],
   "license": "MIT",
   "author": "Dynastxu <151742029+dynastxu@users.noreply.github.com>",
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "format": "oxfmt .",
-    "format:check": "oxfmt --check .",
-    "lint": "oxlint .",
-    "lint:check": "oxlint --check .",
-    "build": "vite build"
+    "build": "vite build && vite build --config vite.client.config.ts && node scripts/copy-build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "oxlint src test scripts vite.config.ts vite.client.config.ts vitest.config.ts",
+    "format": "oxfmt src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --write README.md \"locale/**/*.json\" cordis.patch.yml",
+    "format:check": "oxfmt --check src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --check README.md \"locale/**/*.json\" cordis.patch.yml",
+    "check": "tsc --noEmit && oxlint src test scripts vite.config.ts vite.client.config.ts vitest.config.ts && oxfmt --check src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --check README.md \"locale/**/*.json\" cordis.patch.yml && vitest run && vite build && vite build --config vite.client.config.ts && node scripts/copy-build.mjs"
   },
   "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "oxfmt": "^0.79.0",
     "oxlint": "^1.81.0",
-    "pnpm": "^12.21.0",
     "prettier": "^3.10.1",
     "typescript": "^6.0.3",
     "vite": "^8.3.8",
     "vitest": "^5.1.1"
   },
-  "packageManager": "pnpm@12.21.0"
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@11.28.5",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-context-menu",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
 }

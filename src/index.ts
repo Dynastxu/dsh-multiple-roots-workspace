@@ -1,0 +1,643 @@
+/**
+ * dsh-multiple-roots-workspace — host half.
+ *
+ * A workspace owns an ordered list of attached folders. Each row is either
+ * writable or read-only:
+ *  - writable rows enter every live Session's `workspace-write` set through
+ *    `ctx.sandboxPolicy.registerWritableRoot(session, directory)`;
+ *  - read-only rows are never granted, and `ctx.tools.guard()` denies file
+ *    mutations that land inside them (the path is inside the primary workspace
+ *    or another attached row often enough to matter).
+ *  - the list reaches the model as a runtime-context contribution that renders
+ *    `''` when the workspace has no rows, so a workspace without attached
+ *    folders never injects it. The agent loop commits one snapshot per change,
+ *    which is exactly "once at conversation start, again only when it changes".
+ *
+ * The Client half talks to the routes below; both call the same store.
+ *
+ * @module @dynastxu/dsh-multiple-roots-workspace
+ */
+
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:http";
+
+import { findReadOnlyViolation, renderContext, writablePaths } from "./entries";
+import type { Entry } from "./entries";
+import { canonicalizePath, pathKey } from "./paths";
+import { MultipleRootsError, MultipleRootsStore } from "./store";
+import { service } from "./types";
+import type {
+  AgentsService,
+  AssembleContextLike,
+  ConnectionService,
+  PluginContext,
+  SandboxPolicyService,
+  SessionLike,
+  SystemPromptService,
+  ToolExecutionLike,
+  ToolsService,
+  WebServerService,
+  WorkspaceRegistryService,
+  WorkspaceRow,
+  WorkingDirectoryService,
+} from "./types";
+
+/** Route prefix owned by this plugin. */
+const PREFIX = "/dsh-multiple-roots-workspace";
+const ROUTES = {
+  state: `${PREFIX}/state`,
+  workspaces: `${PREFIX}/workspaces`,
+  addFolder: `${PREFIX}/add-folder`,
+  addWorkspace: `${PREFIX}/add-workspace`,
+  readOnly: `${PREFIX}/read-only`,
+  remove: `${PREFIX}/remove`,
+} as const;
+
+const CONTEXT_NAME = "multiple-roots:folders";
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_WORKSPACE_LIST = 500;
+
+/** One row on the wire to the Client. */
+interface WireEntry {
+  readonly path: string;
+  readonly readOnly: boolean;
+  readonly source: Entry["source"];
+}
+
+/** One live grant owned by this plugin for a Session. */
+interface Grant {
+  readonly path: string;
+  readonly dispose: () => void;
+}
+
+/** Describe one thrown value for logs and route bodies. */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Only a loopback Host may reach these routes; a rebinding page carries its own name. */
+function isLoopbackHost(header: unknown): boolean {
+  if (typeof header !== "string" || header.length === 0) return false;
+  const hostname = header
+    .replace(/:\d+$/u, "")
+    .replace(/^\[|\]$/gu, "")
+    .toLowerCase();
+  return (
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "127.0.0.1" ||
+    /^127\.\d+\.\d+\.\d+$/u.test(hostname)
+  );
+}
+
+/** Write one JSON response. */
+function sendJson(response: ServerResponse, status: number, payload: unknown): void {
+  const body = JSON.stringify(payload);
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+/** Read a bounded JSON object body. */
+function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error("request body is too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      if (chunks.length === 0) {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        resolve(
+          parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : {},
+        );
+      } catch (error) {
+        reject(new Error(`invalid JSON body: ${describeError(error)}`));
+      }
+    });
+    request.on("error", reject);
+  });
+}
+
+/** Project rows to the small wire form the Client renders. */
+function wireEntries(entries: readonly Entry[]): WireEntry[] {
+  return entries.map((entry) => ({
+    path: entry.path,
+    readOnly: entry.readOnly,
+    source: entry.source,
+  }));
+}
+
+/** The plugin entry point. */
+export function apply(ctx: PluginContext): void {
+  const warn = (message: string): void => {
+    try {
+      ctx.logger.warn(message);
+    } catch {
+      // Logging must never fail a tool or route.
+    }
+  };
+  const store = new MultipleRootsStore({ warn });
+
+  /** sessionId -> pathKey -> grant */
+  const grants = new Map<string, Map<string, Grant>>();
+  /** sessionId -> canonical workspace directory */
+  const sessionRoots = new Map<string, string>();
+
+  /** Canonical workspace directory of one Session, cached for its lifetime. */
+  const workspaceOf = (session: SessionLike | undefined): string | undefined => {
+    if (session === undefined) return undefined;
+    const id = session.id;
+    const cached = sessionRoots.get(id);
+    if (cached !== undefined) return cached;
+    const cwd = session.header.cwd;
+    if (typeof cwd !== "string") return undefined;
+    const canonical = canonicalizePath(cwd);
+    if (canonical === undefined) return undefined;
+    sessionRoots.set(id, canonical);
+    return canonical;
+  };
+
+  /** Dispose every grant owned by one Session. */
+  const dropSessionGrants = (id: string): void => {
+    const owned = grants.get(id);
+    if (owned === undefined) return;
+    for (const grant of owned.values()) {
+      try {
+        grant.dispose();
+      } catch {
+        // Already disposed with the sandbox service; nothing left to release.
+      }
+    }
+    grants.delete(id);
+  };
+
+  /**
+   * Bring one Session's grants in line with its workspace's rows. Runs on each
+   * pre-step, so resume, fork, and a plugin reload all converge without a
+   * separate lifecycle registry.
+   */
+  const syncSession = (session: SessionLike): void => {
+    const id = session.id;
+    const workspace = workspaceOf(session);
+    const desired = workspace === undefined ? [] : writablePaths(store.entriesFor(workspace));
+    if (desired.length === 0) {
+      dropSessionGrants(id);
+      return;
+    }
+    const policy = service<SandboxPolicyService>(ctx, "sandboxPolicy");
+    let owned = grants.get(id);
+    if (owned === undefined) {
+      owned = new Map<string, Grant>();
+      grants.set(id, owned);
+    }
+    const wanted = new Set(desired.map((directory) => pathKey(directory)));
+    for (const [key, grant] of owned) {
+      if (wanted.has(key)) continue;
+      try {
+        grant.dispose();
+      } catch {
+        // Already disposed; the service owns the effect lifetime.
+      }
+      owned.delete(key);
+    }
+    if (policy === undefined || typeof policy.registerWritableRoot !== "function") return;
+    for (const directory of desired) {
+      const key = pathKey(directory);
+      if (owned.has(key)) continue;
+      try {
+        owned.set(key, {
+          path: directory,
+          dispose: policy.registerWritableRoot(session, directory),
+        });
+      } catch (error) {
+        warn(
+          `multiple-roots: cannot grant "${directory}" to session "${id}": ${describeError(error)}`,
+        );
+      }
+    }
+  };
+
+  /** Apply a changed workspace to every live Session running in it. */
+  const syncWorkspace = (workspace: string): void => {
+    const agents = service<AgentsService>(ctx, "agents");
+    if (agents === undefined || typeof agents.list !== "function") return;
+    const target = pathKey(workspace);
+    for (const agent of agents.list()) {
+      const root = workspaceOf(agent.session);
+      if (root === undefined || pathKey(root) !== target) continue;
+      try {
+        syncSession(agent.session);
+      } catch (error) {
+        warn(`multiple-roots: cannot sync session "${agent.session.id}": ${describeError(error)}`);
+      }
+    }
+  };
+
+  // Plugin unload must release the registrations it added to the sandbox
+  // service; those effects belong to that service, not to this plugin.
+  ctx.effect(
+    () => () => {
+      for (const id of grants.keys()) dropSessionGrants(id);
+      sessionRoots.clear();
+    },
+    "multiple-roots: grant teardown",
+  );
+
+  // Every admitted step re-reads the workspace rows, so a change made from the
+  // UI reaches the running conversation at its next request.
+  ctx.effect(
+    () =>
+      ctx.on("agent/pre-step", async ({ agent }, next) => {
+        try {
+          if (agent.session !== undefined) syncSession(agent.session);
+        } catch (error) {
+          warn(`multiple-roots: pre-step sync failed: ${describeError(error)}`);
+        }
+        return next();
+      }),
+    "multiple-roots: session grant admission",
+  );
+
+  // A disposed Session must release its registrations and cached cwd.
+  ctx.effect(
+    () =>
+      ctx.on(
+        "session/disposed",
+        (session) => {
+          const id = session.id;
+          dropSessionGrants(id);
+          sessionRoots.delete(id);
+        },
+        { global: true },
+      ),
+    "multiple-roots: session teardown",
+  );
+
+  // Live Sessions that already exist when this plugin loads.
+  ctx.inject(["agents"], (scope) => {
+    const agents = service<AgentsService>(scope, "agents");
+    if (agents === undefined) return;
+    for (const agent of agents.list()) {
+      try {
+        syncSession(agent.session);
+      } catch (error) {
+        warn(`multiple-roots: initial sync failed: ${describeError(error)}`);
+      }
+    }
+  });
+
+  // Read-only rows deny file mutations even when a broader grant would allow
+  // them. A guard is monotonic: no later listener can turn the denial back into
+  // permission.
+  ctx.inject(["tools"], (scope) => {
+    const tools = service<ToolsService>(scope, "tools");
+    if (tools === undefined) return;
+    scope.effect(
+      () =>
+        tools.guard((execution: ToolExecutionLike) => {
+          const session = execution.agent?.session;
+          if (session === undefined) return undefined;
+          const workspace = workspaceOf(session);
+          if (workspace === undefined) return undefined;
+          const entries = store.entriesFor(workspace);
+          if (!entries.some((entry) => entry.readOnly)) return undefined;
+          // Match how the file tools resolve relative targets: the committed
+          // working directory, not necessarily the immutable Session cwd.
+          const workingDirectory = service<WorkingDirectoryService>(ctx, "workingDirectory");
+          const cwd =
+            (workingDirectory !== undefined && typeof workingDirectory.get === "function"
+              ? workingDirectory.get(session)
+              : undefined) ??
+            (typeof session.header.cwd === "string" ? session.header.cwd : process.cwd());
+          let violation;
+          try {
+            violation = findReadOnlyViolation(execution.name, execution.arguments, cwd, entries);
+          } catch (error) {
+            // A check that cannot establish the target may not silently allow the
+            // mutation: the row's read-only intent is the stronger promise here.
+            return `Blocked by multiple-roots: cannot verify "${execution.name}" against the read-only attached folders (${describeError(error)}).`;
+          }
+          if (violation === undefined) return undefined;
+          return (
+            `Blocked by multiple-roots: "${violation.target}" is inside the read-only attached folder "${violation.root}". ` +
+            "Write inside a writable folder instead, or turn off read-only for that folder in the workspace menu."
+          );
+        }),
+      "multiple-roots: read-only guard",
+    );
+  });
+
+  // The model-facing surface. An empty row list renders `''`, which the prompt
+  // registry drops, so the runtime-context snapshot never mentions this plugin
+  // until the workspace actually has attached folders.
+  ctx.inject(["systemPrompt"], (scope) => {
+    const systemPrompt = service<SystemPromptService>(scope, "systemPrompt");
+    if (systemPrompt === undefined) return;
+    let order: number;
+    try {
+      order = systemPrompt.getContextOrder("SANDBOX_POLICY") + 1;
+    } catch {
+      order = 111;
+    }
+    scope.effect(
+      () =>
+        systemPrompt.context({
+          name: CONTEXT_NAME,
+          order,
+          interpolate: false,
+          text: (assembly: AssembleContextLike) => {
+            try {
+              const session = assembly.agent?.session;
+              if (session === undefined) return "";
+              const workspace = workspaceOf(session);
+              if (workspace === undefined) return "";
+              return renderContext(store.entriesFor(workspace));
+            } catch {
+              return "";
+            }
+          },
+        }),
+      "multiple-roots: runtime context",
+    );
+  });
+
+  /** Workspace rows as the registry sees them, or undefined when unavailable. */
+  const registeredWorkspaces = (): WorkspaceRow[] | undefined => {
+    const registry = service<WorkspaceRegistryService>(ctx, "workspaceRegistry");
+    if (registry === undefined || typeof registry.list !== "function") return undefined;
+    try {
+      return registry
+        .list()
+        .slice(0, MAX_WORKSPACE_LIST)
+        .map((workspace) => ({
+          path: workspace.path,
+          title: workspace.title,
+        }));
+    } catch (error) {
+      warn(`multiple-roots: cannot list workspaces: ${describeError(error)}`);
+      return undefined;
+    }
+  };
+
+  /** Whether the path names a registered workspace; permissive without a registry. */
+  const isRegisteredWorkspace = (canonical: string): boolean => {
+    const rows = registeredWorkspaces();
+    if (rows === undefined) return true;
+    return rows.some((row) => pathKey(row.path) === pathKey(canonical));
+  };
+
+  /** The admission fence shared by every route. */
+  const admit = (request: IncomingMessage, response: ServerResponse): boolean => {
+    const connection = service<ConnectionService>(ctx, "connection");
+    if (connection !== undefined && typeof connection.requestRejection === "function") {
+      let rejection: number | undefined;
+      try {
+        rejection = connection.requestRejection(request as { headers: IncomingHttpHeaders });
+      } catch {
+        rejection = 403;
+      }
+      if (rejection !== undefined) {
+        sendJson(response, rejection, {
+          ok: false,
+          error: "Request was not admitted by this DSH client.",
+        });
+        return false;
+      }
+    }
+    if (!isLoopbackHost(request.headers.host)) {
+      sendJson(response, 403, {
+        ok: false,
+        error: "These routes are available on loopback hosts only.",
+      });
+      return false;
+    }
+    const site = request.headers["sec-fetch-site"];
+    if (typeof site === "string" && site !== "same-origin" && site !== "none") {
+      sendJson(response, 403, { ok: false, error: "Cross-site requests are not allowed." });
+      return false;
+    }
+    return true;
+  };
+
+  /** Canonicalize and admit the workspace named by a route. */
+  const requireTarget = (raw: unknown): string => {
+    const canonical = canonicalizePath(raw);
+    if (canonical === undefined)
+      throw new MultipleRootsError("invalid-workspace", "A workspace path must be absolute.");
+    if (!isRegisteredWorkspace(canonical)) {
+      throw new MultipleRootsError(
+        "unknown-workspace",
+        `Not a registered workspace: "${canonical}".`,
+      );
+    }
+    return canonical;
+  };
+
+  /** Common mutation response: persist already happened, then grant fan-out. */
+  const respondEntries = (
+    response: ServerResponse,
+    workspace: string,
+    entries: readonly Entry[],
+  ): void => {
+    try {
+      syncWorkspace(workspace);
+    } catch (error) {
+      warn(`multiple-roots: cannot sync live sessions: ${describeError(error)}`);
+    }
+    sendJson(response, 200, { ok: true, workspacePath: workspace, entries: wireEntries(entries) });
+  };
+
+  /** Map an operation error to its HTTP answer. */
+  const fail = (response: ServerResponse, error: unknown): void => {
+    if (error instanceof MultipleRootsError) {
+      sendJson(response, 400, { ok: false, code: error.code, error: error.message });
+      return;
+    }
+    sendJson(response, 500, { ok: false, error: describeError(error) });
+  };
+
+  ctx.inject(["webServer"], (scope) => {
+    const webServer = service<WebServerService>(scope, "webServer");
+    if (webServer === undefined) return;
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.state,
+          handler: (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "GET") {
+              sendJson(response, 405, { ok: false, error: "GET only." });
+              return;
+            }
+            try {
+              const url = new URL(request.url ?? "/", "http://127.0.0.1");
+              const workspace = requireTarget(url.searchParams.get("workspacePath"));
+              sendJson(response, 200, {
+                ok: true,
+                workspacePath: workspace,
+                entries: wireEntries(store.entriesFor(workspace)),
+              });
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: state route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.workspaces,
+          handler: (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "GET") {
+              sendJson(response, 405, { ok: false, error: "GET only." });
+              return;
+            }
+            const rows = registeredWorkspaces();
+            if (rows === undefined) {
+              sendJson(response, 503, {
+                ok: false,
+                error: "The workspace registry is unavailable in this profile.",
+              });
+              return;
+            }
+            sendJson(response, 200, { ok: true, workspaces: rows });
+          },
+        }),
+      "multiple-roots: workspaces route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.addFolder,
+          handler: async (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "POST") {
+              sendJson(response, 405, { ok: false, error: "POST only." });
+              return;
+            }
+            try {
+              const body = await readJsonBody(request);
+              const workspace = requireTarget(body.workspacePath);
+              const entries = store.addFolder(workspace, body.path);
+              respondEntries(response, workspace, entries);
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: add-folder route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.addWorkspace,
+          handler: async (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "POST") {
+              sendJson(response, 405, { ok: false, error: "POST only." });
+              return;
+            }
+            try {
+              const body = await readJsonBody(request);
+              const workspace = requireTarget(body.workspacePath);
+              const source = requireTarget(body.sourceWorkspacePath);
+              if (pathKey(source) === pathKey(workspace)) {
+                throw new MultipleRootsError(
+                  "primary",
+                  "A workspace cannot be attached to itself.",
+                );
+              }
+              const inherited = store
+                .entriesFor(source)
+                .map((entry) => ({ ...entry, source: "workspace" as const }));
+              const entries = store.addEntries(workspace, [
+                { path: source, readOnly: false, source: "workspace" },
+                ...inherited,
+              ]);
+              respondEntries(response, workspace, entries);
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: add-workspace route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.readOnly,
+          handler: async (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "POST") {
+              sendJson(response, 405, { ok: false, error: "POST only." });
+              return;
+            }
+            try {
+              const body = await readJsonBody(request);
+              if (typeof body.readOnly !== "boolean") {
+                throw new MultipleRootsError("invalid-body", "readOnly must be a boolean.");
+              }
+              const workspace = requireTarget(body.workspacePath);
+              const entries = store.setReadOnly(workspace, body.path, body.readOnly);
+              respondEntries(response, workspace, entries);
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: read-only route",
+    );
+
+    scope.effect(
+      () =>
+        webServer.register({
+          kind: "exact",
+          path: ROUTES.remove,
+          handler: async (request, response) => {
+            if (!admit(request, response)) return;
+            if (request.method !== "POST") {
+              sendJson(response, 405, { ok: false, error: "POST only." });
+              return;
+            }
+            try {
+              const body = await readJsonBody(request);
+              const workspace = requireTarget(body.workspacePath);
+              const entries = store.remove(workspace, body.path);
+              respondEntries(response, workspace, entries);
+            } catch (error) {
+              fail(response, error);
+            }
+          },
+        }),
+      "multiple-roots: remove route",
+    );
+  });
+}
