@@ -39,10 +39,10 @@
     "build": "vite build && vite build --config vite.client.config.ts && node scripts/copy-build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "lint": "oxlint src test scripts vite.config.ts vite.client.config.ts vitest.config.ts",
-    "format": "oxfmt src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --write README.md \"locale/**/*.json\" cordis.patch.yml",
-    "format:check": "oxfmt --check src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --check README.md \"locale/**/*.json\" cordis.patch.yml",
-    "check": "tsc --noEmit && oxlint src test scripts vite.config.ts vite.client.config.ts vitest.config.ts && oxfmt --check src test scripts vite.config.ts vite.client.config.ts vitest.config.ts tsconfig.json package.json && prettier --check README.md \"locale/**/*.json\" cordis.patch.yml && vitest run && vite build && vite build --config vite.client.config.ts && node scripts/copy-build.mjs"
+    "lint": "oxlint .",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
@@ -50,7 +50,6 @@
     "@types/react-dom": "^18.3.7",
     "oxfmt": "^0.79.0",
     "oxlint": "^1.81.0",
-    "prettier": "^3.10.1",
     "typescript": "^6.0.3",
     "vite": "^8.3.8",
     "vitest": "^5.1.1"

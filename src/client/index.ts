@@ -661,7 +661,10 @@ window.__ModuleLoader__.load({
         }
         if (picked === null) return;
         await run(() =>
-          postJson("dsh-multiple-roots-workspace/add-folder", { workspacePath, path: picked }),
+          postJson("dsh-multiple-roots-workspace/add-folder", {
+            workspacePath,
+            path: picked,
+          }),
         );
       };
 
@@ -786,7 +789,11 @@ window.__ModuleLoader__.load({
         createElement(
           "div",
           { className: "mr-root", role: "presentation" },
-          createElement("div", { className: "mr-mask", "aria-hidden": true, onMouseDown: close }),
+          createElement("div", {
+            className: "mr-mask",
+            "aria-hidden": true,
+            onMouseDown: close,
+          }),
           createElement(
             "div",
             {
@@ -913,7 +920,10 @@ window.__ModuleLoader__.load({
                   id: "open",
                   label: t("menu.open"),
                   run: () => {
-                    request.set({ path: workspace.path, displayTitle: workspace.displayTitle });
+                    request.set({
+                      path: workspace.path,
+                      displayTitle: workspace.displayTitle,
+                    });
                   },
                 },
               ],

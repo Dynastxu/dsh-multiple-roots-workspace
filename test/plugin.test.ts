@@ -79,7 +79,10 @@ interface FakeApp {
   readonly ctx: PluginContext;
   readonly warnings: string[];
   readonly effects: (() => void)[];
-  readonly listeners: { preStep?: PreStepListener; disposed?: DisposedListener };
+  readonly listeners: {
+    preStep?: PreStepListener;
+    disposed?: DisposedListener;
+  };
   readonly services: Map<string, unknown>;
 }
 
@@ -115,7 +118,12 @@ const jsonHeaders = { host: "127.0.0.1:9999", "sec-fetch-site": "same-origin" };
 
 async function callRoute(
   handler: WebRouteLike["handler"],
-  options: { method?: string; url?: string; body?: unknown; headers?: Record<string, string> } = {},
+  options: {
+    method?: string;
+    url?: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<{ status: number; json: RouteResult }> {
   const request = new EventEmitter() as unknown as IncomingMessage;
   const mutable = request as unknown as {
@@ -146,14 +154,19 @@ async function callRoute(
   request.emit("end");
   await promise;
   await settled;
-  return { status, json: payload === "" ? {} : (JSON.parse(payload) as RouteResult) };
+  return {
+    status,
+    json: payload === "" ? {} : (JSON.parse(payload) as RouteResult),
+  };
 }
 
 describe("plugin composition", () => {
   it("grants, guards, prompts, and routes through one workspace state", async () => {
     const granted: string[] = [];
     const disposed: string[] = [];
-    const agent: AgentLike = { session: { id: "session-1", header: { cwd: workspace } } };
+    const agent: AgentLike = {
+      session: { id: "session-1", header: { cwd: workspace } },
+    };
     const routes = new Map<string, WebRouteLike["handler"]>();
     const registrations: {
       guard?: (execution: ToolExecutionLike) => string | undefined;

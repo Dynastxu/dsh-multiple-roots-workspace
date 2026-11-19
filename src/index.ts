@@ -429,7 +429,10 @@ export function apply(ctx: PluginContext): void {
     }
     const site = request.headers["sec-fetch-site"];
     if (typeof site === "string" && site !== "same-origin" && site !== "none") {
-      sendJson(response, 403, { ok: false, error: "Cross-site requests are not allowed." });
+      sendJson(response, 403, {
+        ok: false,
+        error: "Cross-site requests are not allowed.",
+      });
       return false;
     }
     return true;
@@ -460,13 +463,21 @@ export function apply(ctx: PluginContext): void {
     } catch (error) {
       warn(`multiple-roots: cannot sync live sessions: ${describeError(error)}`);
     }
-    sendJson(response, 200, { ok: true, workspacePath: workspace, entries: wireEntries(entries) });
+    sendJson(response, 200, {
+      ok: true,
+      workspacePath: workspace,
+      entries: wireEntries(entries),
+    });
   };
 
   /** Map an operation error to its HTTP answer. */
   const fail = (response: ServerResponse, error: unknown): void => {
     if (error instanceof MultipleRootsError) {
-      sendJson(response, 400, { ok: false, code: error.code, error: error.message });
+      sendJson(response, 400, {
+        ok: false,
+        code: error.code,
+        error: error.message,
+      });
       return;
     }
     sendJson(response, 500, { ok: false, error: describeError(error) });

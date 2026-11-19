@@ -263,7 +263,10 @@ describe("MultipleRootsStore", () => {
     const filePath = storage();
     writeFileSync(filePath, "{not json");
     const warnings: string[] = [];
-    const store = new MultipleRootsStore({ filePath, warn: (message) => warnings.push(message) });
+    const store = new MultipleRootsStore({
+      filePath,
+      warn: (message) => warnings.push(message),
+    });
     expect(store.entriesFor(workspace)).toEqual([]);
     expect(warnings).toHaveLength(1);
   });
@@ -274,7 +277,11 @@ describe("MultipleRootsStore", () => {
       filePath,
       JSON.stringify({
         version: 1,
-        workspaces: { [workspace]: { entries: [{ path: folderA }, { path: "relative" }, null] } },
+        workspaces: {
+          [workspace]: {
+            entries: [{ path: folderA }, { path: "relative" }, null],
+          },
+        },
       }),
     );
     const store = new MultipleRootsStore({ filePath });
