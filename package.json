@@ -11,8 +11,14 @@
     "workspace",
     "writable-root"
   ],
+  "homepage": "https://github.com/Dynastxu/dsh-multiple-roots-workspace",
+  "bugs": "https://github.com/Dynastxu/dsh-multiple-roots-workspace/issues",
   "license": "MIT",
   "author": "Dynastxu <151742029+dynastxu@users.noreply.github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dynastxu/dsh-multiple-roots-workspace.git"
+  },
   "files": [
     "lib",
     "cordis.patch.yml",
@@ -70,11 +76,5 @@
         "@deepseek-ai/dsh-client-locale"
       ]
     }
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Dynastxu/dsh-multiple-roots-workspace.git"
-  },
-  "homepage": "https://github.com/Dynastxu/dsh-multiple-roots-workspace",
-  "bugs": "https://github.com/Dynastxu/dsh-multiple-roots-workspace/issues"
+  }
 }
